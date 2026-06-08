@@ -97,6 +97,11 @@ pub fn decrypt_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Er
     word_deflate(&decrypted, expected)
 }
 
+/// Temporary public entry point for probing
+pub fn word_deflate_pub(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+    word_deflate(input, expected)
+}
+
 fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     let mut br = WordBitReader::new(input);
     let mut out = Vec::with_capacity(expected);
