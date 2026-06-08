@@ -1,6 +1,6 @@
 # unvise
 
-Extracts files from Installer VISE archives, the Mac installer format created by MindVision Software in the 1990s and used widely through the classic Mac OS era
+Extracts files from Mac-based Installer VISE archives, the installer format created by MindVision Software in the 1990s and used widely through the classic Mac OS era
 
 ## Supported versions
 
@@ -8,8 +8,9 @@ Extracts files from Installer VISE archives, the Mac installer format created by
 |---|---|---|---|
 | 00 01 | VISE 1.x | LZSS | Working |
 | 02 00 - 02 02 | VISE 2.x | LZSS | Working |
-| 03 00 - 03 07 | VISE 3.x - 5.x | Cipher + DEFLATE | Working |
-| 03 08+ | VISE 6.x+ | Different structure (PACK) | Not supported |
+| 03 00 - 03 05 | VISE 3.x - 5.x | Cipher + DEFLATE | Working |
+| 03 06 - 03 07 | VISE 5.x | Cipher + DEFLATE | Working |
+| 03 08+ | VISE 6.x+ | Encrypted CVCT body | Not supported |
 
 ## Install
 
@@ -67,7 +68,7 @@ Done: 87 extracted, 0 skipped, 0 failed
 VISE archives are structured around four chunk types:
 
 - **SVCT:** archive header at offset 0. Contains format version at bytes 0x12-0x13 and a pointer to the CVCT at 0x24
-- **CVCT:** file table container. Holds a sequence of DVCT and FVCT records
+- **CVCT:** file table container. Holds a sequence of DVCT and FVCT records. v3.06+ adds a 100-byte header with chunk-type offsets (PACK, BBrd, CODE, etc.) before the record body
 - **DVCT:** directory entry. Names the folder that subsequent files belong to
 - **FVCT:** file entry. Contains Mac type/creator codes, compressed and uncompressed sizes for both data and resource forks, and the offset to the compressed data within the archive
 
@@ -75,7 +76,7 @@ VISE archives are structured around four chunk types:
 
 **v2 (LZSS):** A 1024-byte circular window with 10-bit absolute position references and 6-bit match lengths (minimum 2). Flag bytes are MSB-first: 0 = literal, 1 = back-reference
 
-**v3 (Cipher + DEFLATE):** Data passes through a byte-pair swap, then a 256-byte substitution cipher, then DEFLATE decompression. The DEFLATE variant aligns stored blocks to 16-bit word boundaries rather than byte boundaries (a quirk of the PPC Dcmp 1005 decompressor)
+**v3 (Cipher + DEFLATE):** Data passes through a byte-pair swap, then a 256-byte substitution cipher, then DEFLATE decompression. The DEFLATE variant aligns stored blocks to 16-bit word boundaries rather than byte boundaries, a consequence of the decompressor's word-based bitstream reader
 
 ### Multi-segment installers
 
@@ -87,7 +88,8 @@ Entries with bit 27 set in the flags field (offset FVCT+12) are not files; they 
 
 ## Limitations
 
-- **VISE 6.0.1+ (format 03 08 and above)** uses a different file table structure (PACK/BBrd/CODE chunks) that this tool does not parse
+- **VISE for Windows** is not supported
+- **VISE 6.0.1+ (format 03 08 and above)** encrypts the CVCT body; decryption is not yet implemented
 - **Multi-segment installers** require all segments in one file. Files on missing segments are reported and skipped
 - **Resource fork semantics** are not preserved beyond raw byte extraction. No AppleDouble or MacBinary output is generated
 

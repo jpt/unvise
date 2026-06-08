@@ -2,11 +2,12 @@
 //!
 //! Supports all observed VISE versions from 00 01 through 03 07:
 //! - v2 (00 01, 02 0x): LZSS with a 1024-byte circular window
-//! - v3 (03 0x): byte-swap + substitution cipher + word-aligned DEFLATE
+//! - v3 (03 00 through 03 05): byte-swap + substitution cipher + word-aligned DEFLATE
+//! - v3.06/07: new-style CVCT header with uncompressed body
 
 #![warn(clippy::pedantic)]
 
-pub(crate) mod deflate;
+pub mod deflate;
 pub(crate) mod lzss;
 pub mod macbinary;
 mod parse;
