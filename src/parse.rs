@@ -1,9 +1,10 @@
 //! VISE archive file table parser
 //!
 //! Parses the SVCT/CVCT/DVCT/FVCT chunk structure present in all observed
-//! VISE versions from 00 01 through 03 07. The parser scans for tags rather
-//! than relying on fixed offsets, and infers per-version name field positions
-//! dynamically from tag stride patterns
+//! VISE versions from 00 01 through 03 07, including the new-style CVCT
+//! header used by v3.06+. The parser scans for tags rather than relying on
+//! fixed offsets, and infers per-version name field positions dynamically
+//! from tag stride patterns
 
 use crate::Error;
 
@@ -22,6 +23,10 @@ const FVCT_NLEN: usize = 122;
 const FVCT_MIN_RECORD: usize = FVCT_NLEN + 1;
 const DVCT_NLEN: usize = 80;
 const DVCT_MIN_RECORD: usize = DVCT_NLEN + 1;
+
+/// v3.06+ CVCT uses a 100-byte header with chunk-type offsets before the body
+const NEWSTYLE_CVCT_BODY: usize = 0x64;
+const NEWSTYLE_CVCT_COMPRESSED_FLAG: usize = 0x08;
 
 /// A parsed entry from the VISE file table
 #[derive(Debug)]
@@ -106,7 +111,20 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         return Err(Error::InvalidArchive(format!("missing CVCT at 0x{cvct:x}")));
     }
 
-    let tags = scan_tags(data, cvct + 4);
+    let body_start = if data.len() >= cvct + NEWSTYLE_CVCT_BODY
+        && &data[cvct + 0x14..cvct + 0x18] == b"PACK"
+    {
+        if read_u32(data, cvct + NEWSTYLE_CVCT_COMPRESSED_FLAG)? != 0 {
+            return Err(Error::InvalidArchive(
+                "encrypted CVCT body (v3.08+) is not yet supported".into(),
+            ));
+        }
+        cvct + NEWSTYLE_CVCT_BODY
+    } else {
+        cvct + 4
+    };
+
+    let tags = scan_tags(data, body_start);
     let fvct_name_off = infer_name_off(data, &tags, b"FVCT", FVCT_NLEN);
     let dvct_name_off = infer_name_off(data, &tags, b"DVCT", DVCT_NLEN);
 
