@@ -7,11 +7,11 @@ Extracts files from Mac-based Installer VISE archives, the installer format crea
 | Format bytes | Compression | Notes |
 |---|---|---|
 | 00 01, 02 0x | LZSS | Earliest versions |
-| 03 00 – 03 05 | Cipher + DEFLATE | |
-| 03 06 – 03 07 | Cipher + DEFLATE | New CVCT header with chunk-type table |
-| 03 08 – 03 0e | Cipher + DEFLATE | CVCT body is compressed |
+| 03 00 - 03 05 | Cipher + DEFLATE | Word-aligned DEFLATE with substitution cipher |
+| 03 06 - 03 07 | Cipher + DEFLATE | New CVCT header with chunk-type table |
+| 03 08 - 03 0e | Cipher + DEFLATE | CVCT body is compressed |
 
-The format version is at bytes 0x12–0x13 of the SVCT header. These are archive format versions, not product versions — MindVision didn't bump the format with every product release. The highest format version tested was 03 0e, from Installer VISE 8.5 (July 2005)
+The format version is at bytes 0x12-0x13 of the SVCT header. These are archive format versions, not product versions. The highest format version tested was 03 0e, from Installer VISE 8.5 (July 2005)
 
 ## Install
 

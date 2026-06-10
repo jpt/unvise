@@ -225,14 +225,14 @@ fn build_huffman_table(lengths: &[u8]) -> HuffmanTable {
         return HuffmanTable { entries: vec![(0, 0); TABLE_SIZE].into_boxed_slice() };
     }
 
-    let mut bl_count = vec![0u32; max_bits as usize + 1];
+    let mut bl_count = [0u32; 16];
     for &len in lengths {
         if len > 0 {
             bl_count[usize::from(len)] += 1;
         }
     }
 
-    let mut next_code = vec![0u32; max_bits as usize + 1];
+    let mut next_code = [0u32; 16];
     let mut code = 0u32;
     for bits in 1..=max_bits {
         code = (code + bl_count[bits as usize - 1]) << 1;
@@ -300,9 +300,9 @@ fn decode_huffman_block(
     let (lit_table, dist_table) = if fixed {
         (&*FIXED_LIT, &*FIXED_DIST)
     } else {
-        let (ll, dl) = decode_dynamic_trees(reader)?;
-        dyn_lit = build_huffman_table(&ll);
-        dyn_dist = build_huffman_table(&dl);
+        let (lengths, hlit) = decode_dynamic_trees(reader)?;
+        dyn_lit = build_huffman_table(&lengths[..hlit]);
+        dyn_dist = build_huffman_table(&lengths[hlit..]);
         (&dyn_lit, &dyn_dist)
     };
 
@@ -340,7 +340,7 @@ fn decode_huffman_block(
 
 const CL_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
 
-fn decode_dynamic_trees(reader: &mut WordBitReader) -> Result<(Vec<u8>, Vec<u8>), Error> {
+fn decode_dynamic_trees(reader: &mut WordBitReader) -> Result<(Vec<u8>, usize), Error> {
     let hlit = reader.read_bits(5) as usize + 257;
     let hdist = reader.read_bits(5) as usize + 1;
     let hclen = reader.read_bits(4) as usize + 4;
@@ -379,7 +379,7 @@ fn decode_dynamic_trees(reader: &mut WordBitReader) -> Result<(Vec<u8>, Vec<u8>)
         }
     }
 
-    Ok((lengths[..hlit].to_vec(), lengths[hlit..hlit + hdist].to_vec()))
+    Ok((lengths, hlit))
 }
 
 const LEN_BASE: [u16; 29] = [
