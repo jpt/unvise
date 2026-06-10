@@ -1,10 +1,10 @@
-//! Extractor for Installer VISE archives (`MindVision`, 1990s–2000s Mac)
+//! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s Mac)
 //!
 //! Supports all observed VISE format versions from 00 01 through 03 0e:
 //! - v2 (00 01, 02 0x): LZSS with a 1024-byte circular window
-//! - v3 (03 00 – 03 05): byte-swap + substitution cipher + word-aligned DEFLATE
-//! - v3.06–07: new-style CVCT header with chunk-type table
-//! - v3.08–0e: CVCT body compressed with word-aligned DEFLATE
+//! - v3 (03 00 - 03 05): byte-swap + substitution cipher + word-aligned DEFLATE
+//! - v3.06-07: new-style CVCT header with chunk-type table
+//! - v3.08-0e: CVCT body compressed with word-aligned DEFLATE
 
 #![warn(clippy::pedantic)]
 
