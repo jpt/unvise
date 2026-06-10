@@ -1,12 +1,11 @@
 //! VISE archive file table parser
 //!
 //! Parses the SVCT/CVCT/DVCT/FVCT chunk structure present in all observed
-//! VISE versions from 00 01 through 03 07, including the new-style CVCT
-//! header used by v3.06+. The parser scans for tags rather than relying on
-//! fixed offsets, and infers per-version name field positions dynamically
-//! from tag stride patterns
+//! VISE versions from 00 01 through 03 0e. The parser scans for tags rather
+//! than relying on fixed offsets, and infers per-version name field positions
+//! dynamically from tag stride patterns
 
-use crate::Error;
+use crate::{deflate, Error};
 
 const FVCT_FLAGS: usize = 12;
 const FVCT_TYPE: usize = 44;
@@ -26,7 +25,8 @@ const DVCT_MIN_RECORD: usize = DVCT_NLEN + 1;
 
 /// v3.06+ CVCT uses a 100-byte header with chunk-type offsets before the body
 const NEWSTYLE_CVCT_BODY: usize = 0x64;
-const NEWSTYLE_CVCT_COMPRESSED_FLAG: usize = 0x08;
+/// When non-zero, the CVCT body is compressed with word-aligned DEFLATE (no cipher)
+const NEWSTYLE_CVCT_COMPRESSED: usize = 0x08;
 
 /// A parsed entry from the VISE file table
 #[derive(Debug)]
@@ -111,45 +111,60 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         return Err(Error::InvalidArchive(format!("missing CVCT at 0x{cvct:x}")));
     }
 
-    let body_start = if data.len() >= cvct + NEWSTYLE_CVCT_BODY
-        && &data[cvct + 0x14..cvct + 0x18] == b"PACK"
-    {
-        if read_u32(data, cvct + NEWSTYLE_CVCT_COMPRESSED_FLAG)? != 0 {
-            return Err(Error::InvalidArchive(
-                "encrypted CVCT body (v3.08+) is not yet supported".into(),
-            ));
+    let (body_start, decompressed_body);
+    if data.len() >= cvct + NEWSTYLE_CVCT_BODY && &data[cvct + 0x14..cvct + 0x18] == b"PACK" {
+        if read_u32(data, cvct + NEWSTYLE_CVCT_COMPRESSED)? != 0 {
+            let body_size = read_u32(data, cvct + 4)? as usize;
+            let comp_start = cvct + NEWSTYLE_CVCT_BODY;
+            let comp_end = comp_start + body_size;
+            if comp_end > data.len() {
+                return Err(Error::InvalidArchive(
+                    "compressed CVCT body extends past archive end".into(),
+                ));
+            }
+            decompressed_body =
+                deflate::decompress_raw_word_deflate(&data[comp_start..comp_end], 0)?;
+            eprintln!(
+                "  decompressed CVCT body ({body_size} -> {} bytes)",
+                decompressed_body.len()
+            );
+            body_start = 0;
+        } else {
+            decompressed_body = Vec::new();
+            body_start = cvct + NEWSTYLE_CVCT_BODY;
         }
-        cvct + NEWSTYLE_CVCT_BODY
     } else {
-        cvct + 4
-    };
+        decompressed_body = Vec::new();
+        body_start = cvct + 4;
+    }
 
-    let tags = scan_tags(data, body_start);
-    let fvct_name_off = infer_name_off(data, &tags, b"FVCT", FVCT_NLEN);
-    let dvct_name_off = infer_name_off(data, &tags, b"DVCT", DVCT_NLEN);
+    let parse_data: &[u8] = if decompressed_body.is_empty() { data } else { &decompressed_body };
+    let tags = scan_tags(parse_data, body_start);
+    let fvct_name_off = infer_name_off(parse_data, &tags, TagKind::Fvct, FVCT_NLEN);
+    let dvct_name_off = infer_name_off(parse_data, &tags, TagKind::Dvct, DVCT_NLEN);
 
     let mut entries = Vec::with_capacity(tags.len());
     let mut current_dir = String::new();
 
-    for &(pos, is_fvct) in &tags {
-        if is_fvct {
-            if pos + FVCT_MIN_RECORD > data.len() {
+    for &(pos, kind) in &tags {
+        if kind == TagKind::Fvct {
+            if pos + FVCT_MIN_RECORD > parse_data.len() {
                 continue;
             }
-            let nlen = usize::from(data[pos + FVCT_NLEN]);
-            let name = if pos + fvct_name_off + nlen <= data.len() {
-                mac_str(data, pos + fvct_name_off, nlen)
+            let nlen = usize::from(parse_data[pos + FVCT_NLEN]);
+            let name = if pos + fvct_name_off + nlen <= parse_data.len() {
+                mac_str(parse_data, pos + fvct_name_off, nlen)
             } else {
                 String::new()
             };
 
-            let flags = read_u32(data, pos + FVCT_FLAGS)?;
-            let segment = read_u16(data, pos + FVCT_SEGMENT)?;
+            let flags = read_u32(parse_data, pos + FVCT_FLAGS)?;
+            let segment = read_u16(parse_data, pos + FVCT_SEGMENT)?;
 
             let mut ft = [0u8; 4];
-            ft.copy_from_slice(&data[pos + FVCT_TYPE..pos + FVCT_TYPE + 4]);
+            ft.copy_from_slice(&parse_data[pos + FVCT_TYPE..pos + FVCT_TYPE + 4]);
             let mut cr = [0u8; 4];
-            cr.copy_from_slice(&data[pos + FVCT_CREATOR..pos + FVCT_CREATOR + 4]);
+            cr.copy_from_slice(&parse_data[pos + FVCT_CREATOR..pos + FVCT_CREATOR + 4]);
 
             entries.push(Entry::File(FileEntry {
                 name,
@@ -157,18 +172,18 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
                 creator: cr,
                 flags,
                 segment,
-                comp_data: read_u32(data, pos + FVCT_COMP_DATA)? as usize,
-                uncomp_data: read_u32(data, pos + FVCT_UNCOMP_DATA)? as usize,
-                comp_rsrc: read_u32(data, pos + FVCT_COMP_RSRC)? as usize,
-                uncomp_rsrc: read_u32(data, pos + FVCT_UNCOMP_RSRC)? as usize,
-                data_offset: read_u32(data, pos + FVCT_DATA_OFFSET)? as usize,
-                block_data_off: read_u32(data, pos + FVCT_BLOCK_DATA_OFF)? as usize,
-                block_rsrc_off: read_u32(data, pos + FVCT_BLOCK_RSRC_OFF)? as usize,
+                comp_data: read_u32(parse_data, pos + FVCT_COMP_DATA)? as usize,
+                uncomp_data: read_u32(parse_data, pos + FVCT_UNCOMP_DATA)? as usize,
+                comp_rsrc: read_u32(parse_data, pos + FVCT_COMP_RSRC)? as usize,
+                uncomp_rsrc: read_u32(parse_data, pos + FVCT_UNCOMP_RSRC)? as usize,
+                data_offset: read_u32(parse_data, pos + FVCT_DATA_OFFSET)? as usize,
+                block_data_off: read_u32(parse_data, pos + FVCT_BLOCK_DATA_OFF)? as usize,
+                block_rsrc_off: read_u32(parse_data, pos + FVCT_BLOCK_RSRC_OFF)? as usize,
             }));
-        } else if pos + DVCT_MIN_RECORD <= data.len() {
-            let nlen = usize::from(data[pos + DVCT_NLEN]);
-            if pos + dvct_name_off + nlen <= data.len() {
-                current_dir = mac_str(data, pos + dvct_name_off, nlen);
+        } else if kind == TagKind::Dvct && pos + DVCT_MIN_RECORD <= parse_data.len() {
+            let nlen = usize::from(parse_data[pos + DVCT_NLEN]);
+            if pos + dvct_name_off + nlen <= parse_data.len() {
+                current_dir = mac_str(parse_data, pos + dvct_name_off, nlen);
             }
             entries.push(Entry::Dir(current_dir.clone()));
         }
@@ -177,18 +192,32 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
     Ok(ArchiveInfo { entries, use_deflate, num_segments, fmt_major, fmt_minor })
 }
 
-/// Scans for DVCT/FVCT tags starting at `from`. Returns (offset, `is_fvct`) pairs.
-/// Advances byte-by-byte on non-match because tags are not necessarily aligned
-/// within the CVCT; variable-length name fields break any fixed stride
-fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, bool)> {
+/// Non-directory CVCT record tags, used only for stride inference
+/// FVCT and DVCT are matched explicitly in `scan_tags` and are not in this list
+const OTHER_TAGS: &[&[u8; 4]] = &[
+    b"PACK", b"BBrd", b"CODE", b"BDIR", b"PROJ", b"INDN", b"DfIl",
+];
+
+/// Tag type classification for scan results
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TagKind { Fvct, Dvct, Other }
+
+/// Scans for known CVCT tags starting at `from`. Returns (offset, kind) pairs
+/// All tag types are scanned so stride inference works even with single-record
+/// archives; only FVCT and DVCT produce extracted entries
+fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, TagKind)> {
     let mut tags = Vec::new();
     let mut p = from;
     while p + 4 <= data.len() {
-        if &data[p..p + 4] == b"FVCT" {
-            tags.push((p, true));
+        let tag = &data[p..p + 4];
+        if tag == b"FVCT" {
+            tags.push((p, TagKind::Fvct));
             p += 4;
-        } else if &data[p..p + 4] == b"DVCT" {
-            tags.push((p, false));
+        } else if tag == b"DVCT" {
+            tags.push((p, TagKind::Dvct));
+            p += 4;
+        } else if OTHER_TAGS.iter().any(|t| tag == *t) {
+            tags.push((p, TagKind::Other));
             p += 4;
         } else {
             p += 1;
@@ -198,17 +227,22 @@ fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, bool)> {
 }
 
 /// Infers the name field offset for a tag type by examining stride patterns.
-/// The name is always the last field in a record, so `name_off` = stride - nlen
-fn infer_name_off(data: &[u8], tags: &[(usize, bool)], kind: &[u8], nlen_off: usize) -> usize {
-    let is_fvct = kind == b"FVCT";
+/// The name is always the last field in a record, so `name_off` = stride - nlen.
+/// When there are multiple consecutive same-type tags, stride voting across
+/// pairs gives a robust answer. For single-record archives (only one tag of a
+/// given type), falls back to using the next tag of any type as a stride bound.
+fn infer_name_off(data: &[u8], tags: &[(usize, TagKind)], target: TagKind, nlen_off: usize) -> usize {
     let mut votes: Vec<(usize, usize)> = Vec::new();
 
     for i in 0..tags.len().saturating_sub(1) {
-        let (pos, tag_is_fvct) = tags[i];
-        if tag_is_fvct != is_fvct {
+        let (pos, kind) = tags[i];
+        if kind != target {
             continue;
         }
-        let stride = tags[i + 1].0 - pos;
+        // Prefer stride to next same-type tag; fall back to next tag of any type
+        let next_same = tags[i + 1..].iter().find(|(_, k)| *k == target);
+        let stride_to = next_same.map_or(tags[i + 1].0, |&(p, _)| p);
+        let stride = stride_to - pos;
         if pos + nlen_off >= data.len() {
             continue;
         }
@@ -275,4 +309,90 @@ fn mac_str(data: &[u8], off: usize, len: usize) -> String {
     let start = bytes.iter().position(|&b| b != b' ' && b != 0).unwrap_or(len);
     let end = bytes.iter().rposition(|&b| b != b' ' && b != 0).map_or(start, |i| i + 1);
     bytes[start..end].iter().map(|&b| mac_roman_char(b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tag_body(tags: &[(&[u8; 4], usize)]) -> Vec<u8> {
+        let total: usize = tags.iter().map(|(_, sz)| 4 + sz).sum();
+        let mut buf = vec![0u8; total];
+        let mut pos = 0;
+        for (tag, body_len) in tags {
+            buf[pos..pos + 4].copy_from_slice(*tag);
+            pos += 4 + body_len;
+        }
+        buf
+    }
+
+    #[test]
+    fn scan_tags_finds_all_types() {
+        let data = make_tag_body(&[
+            (b"FVCT", 186),
+            (b"PACK", 26),
+            (b"BBrd", 62),
+            (b"INDN", 10),
+        ]);
+        let tags = scan_tags(&data, 0);
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[0], (0, TagKind::Fvct));
+        assert_eq!(tags[1], (190, TagKind::Other));
+        assert_eq!(tags[2], (220, TagKind::Other));
+        assert_eq!(tags[3], (286, TagKind::Other));
+    }
+
+    #[test]
+    fn scan_tags_ignores_unknown() {
+        let mut data = vec![0u8; 20];
+        data[0..4].copy_from_slice(b"FVCT");
+        data[8..12].copy_from_slice(b"XXXX");
+        data[16..20].copy_from_slice(b"DVCT");
+        let tags = scan_tags(&data, 0);
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].1, TagKind::Fvct);
+        assert_eq!(tags[1].1, TagKind::Dvct);
+    }
+
+    #[test]
+    fn infer_name_off_multi_record() {
+        // Two FVCT records each 200 bytes apart, name_len=6 → name_off = 194
+        let mut data = vec![0u8; 406];
+        data[0..4].copy_from_slice(b"FVCT");
+        data[FVCT_NLEN] = 6;
+        data[200..204].copy_from_slice(b"FVCT");
+        data[200 + FVCT_NLEN] = 6;
+        data[400..404].copy_from_slice(b"PACK");
+        let tags = scan_tags(&data, 0);
+        let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
+        assert_eq!(off, 194);
+    }
+
+    #[test]
+    fn infer_name_off_single_record_cross_type_fallback() {
+        // Single FVCT followed by a different tag type — forces cross-type
+        // stride fallback (no consecutive same-type tags to vote on)
+        let mut data = vec![0u8; 230];
+        data[0..4].copy_from_slice(b"FVCT");
+        data[FVCT_NLEN] = 6;
+        data[184..190].copy_from_slice(b"myfile");
+        data[190..194].copy_from_slice(b"PACK");
+        let tags = scan_tags(&data, 0);
+        assert_eq!(tags.len(), 2);
+        let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
+        assert_eq!(off, 184);
+        assert_eq!(mac_str(&data, off, 6), "myfile");
+    }
+
+    #[test]
+    fn infer_name_off_default_fallback() {
+        // Single tag, no next tag → falls back to nlen_off + 2
+        let mut data = vec![0u8; 200];
+        data[0..4].copy_from_slice(b"FVCT");
+        data[FVCT_NLEN] = 4;
+        let tags = scan_tags(&data, 0);
+        assert_eq!(tags.len(), 1);
+        let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
+        assert_eq!(off, FVCT_NLEN + 2);
+    }
 }

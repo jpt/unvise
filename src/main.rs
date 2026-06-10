@@ -8,8 +8,7 @@ fn main() {
     if args.len() < 2 {
         eprintln!("usage: {} <vise_installer> [output_dir]", args[0]);
         eprintln!();
-        eprintln!("Extracts files from Installer VISE archives (versions 00 01 through 03 07).");
-        eprintln!("v3.08+ archives with encrypted bodies are not yet supported.");
+        eprintln!("Extracts files from Installer VISE archives (format versions 00 01 through 03 0e).");
         eprintln!("Accepts raw data forks or MacBinary-wrapped files.");
         process::exit(1);
     }
