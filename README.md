@@ -4,13 +4,14 @@ Extracts files from Mac-based Installer VISE archives, the installer format crea
 
 ## Supported versions
 
-| Format bytes | VISE version | Compression | Status |
-|---|---|---|---|
-| 00 01 | VISE 1.x | LZSS | Working |
-| 02 00 - 02 02 | VISE 2.x | LZSS | Working |
-| 03 00 - 03 05 | VISE 3.x - 5.x | Cipher + DEFLATE | Working |
-| 03 06 - 03 07 | VISE 5.x | Cipher + DEFLATE | Working |
-| 03 08+ | VISE 6.x+ | Encrypted CVCT body | Not supported |
+| Format bytes | Compression | Notes |
+|---|---|---|
+| 00 01, 02 0x | LZSS | Earliest versions |
+| 03 00 – 03 05 | Cipher + DEFLATE | |
+| 03 06 – 03 07 | Cipher + DEFLATE | New CVCT header with chunk-type table |
+| 03 08 – 03 0e | Cipher + DEFLATE | CVCT body is compressed |
+
+The format version is at bytes 0x12–0x13 of the SVCT header. These are archive format versions, not product versions — MindVision didn't bump the format with every product release. The highest format version tested was 03 0e, from Installer VISE 8.5 (July 2005)
 
 ## Install
 
@@ -68,7 +69,7 @@ Done: 87 extracted, 0 skipped, 0 failed
 VISE archives are structured around four chunk types:
 
 - **SVCT:** archive header at offset 0. Contains format version at bytes 0x12-0x13 and a pointer to the CVCT at 0x24
-- **CVCT:** file table container. Holds a sequence of DVCT and FVCT records. v3.06+ adds a 100-byte header with chunk-type offsets (PACK, BBrd, CODE, etc.) before the record body
+- **CVCT:** file table container. Holds a sequence of DVCT and FVCT records. v3.06+ adds a 100-byte header with chunk-type offsets (PACK, BBrd, CODE, etc.) before the record body. v3.08+ compresses the record body with word-aligned DEFLATE
 - **DVCT:** directory entry. Names the folder that subsequent files belong to
 - **FVCT:** file entry. Contains Mac type/creator codes, compressed and uncompressed sizes for both data and resource forks, and the offset to the compressed data within the archive
 
@@ -88,8 +89,7 @@ Entries with bit 27 set in the flags field (offset FVCT+12) are not files; they 
 
 ## Limitations
 
-- **VISE for Windows** is not supported
-- **VISE 6.0.1+ (format 03 08 and above)** encrypts the CVCT body; decryption is not yet implemented
+- **VISE for Windows** is not supported (untested)
 - **Multi-segment installers** require all segments in one file. Files on missing segments are reported and skipped
 - **Resource fork semantics** are not preserved beyond raw byte extraction. No AppleDouble or MacBinary output is generated
 
