@@ -6,9 +6,6 @@
 - Huffman table builder uses stack arrays instead of heap allocations for code-length counts
 - Dynamic tree decoder returns a single allocation instead of two copies
 
-### Removed
-- Unused `cipher` module
-
 ## 0.1.2
 
 ### Added
