@@ -17,9 +17,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use parse::{ArchiveInfo, Entry, FileEntry};
+
+/// How far total extracted output may exceed the archive size before extraction
+/// aborts. DEFLATE can't expand by more than ~1032:1, so legitimate output stays
+/// well under this; anything beyond is a bomb
+const OUTPUT_BUDGET_RATIO: usize = 1056;
+/// Floor for the output budget so tiny archives still extract normally
+const OUTPUT_BUDGET_HEADROOM: usize = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -81,13 +88,24 @@ impl Archive {
         let mut cur_dir = out_dir.to_path_buf();
         let mut result = ExtractResult { extracted: 0, skipped: 0, failed: 0 };
 
+        let output_budget = self.data.len()
+            .saturating_mul(OUTPUT_BUDGET_RATIO)
+            .saturating_add(OUTPUT_BUDGET_HEADROOM);
+        let mut total_out: usize = 0;
+
         for entry in &self.info.entries {
             match entry {
                 Entry::Dir(name) => {
                     let name = clean_name(name);
-                    if !name.is_empty() {
-                        cur_dir = out_dir.join(&name);
-                        fs::create_dir_all(&cur_dir)?;
+                    if name.is_empty() {
+                        continue;
+                    }
+                    match safe_join(out_dir, &name) {
+                        Some(dir) => {
+                            cur_dir = dir;
+                            fs::create_dir_all(&cur_dir)?;
+                        }
+                        None => eprintln!("  [unsafe path] skipping directory {name}"),
                     }
                 }
                 Entry::File(f) => {
@@ -103,19 +121,32 @@ impl Archive {
                         continue;
                     }
 
-                    let path = cur_dir.join(&name);
+                    let Some(path) = safe_join(&cur_dir, &name) else {
+                        eprintln!("  [unsafe path] skipping {name}");
+                        result.skipped += 1;
+                        continue;
+                    };
                     if let Some(p) = path.parent() {
                         fs::create_dir_all(p)?;
                     }
 
-                    if let Err(e) = self.extract_file(f, &path, &shared_blocks, &offset_groups) {
-                        eprintln!("  FAIL {name}: {e}");
-                        result.failed += 1;
-                        continue;
+                    match self.extract_file(f, &path, &shared_blocks, &offset_groups) {
+                        Err(e) => {
+                            eprintln!("  FAIL {name}: {e}");
+                            result.failed += 1;
+                        }
+                        Ok(written) => {
+                            eprintln!("  {name} ({} + {} bytes)", f.uncomp_data, f.uncomp_rsrc);
+                            result.extracted += 1;
+                            total_out = total_out.saturating_add(written);
+                            if total_out > output_budget {
+                                eprintln!(
+                                    "  aborting: extracted output exceeds {output_budget} byte budget (possible decompression bomb)"
+                                );
+                                break;
+                            }
+                        }
                     }
-
-                    eprintln!("  {name} ({} + {} bytes)", f.uncomp_data, f.uncomp_rsrc);
-                    result.extracted += 1;
                 }
             }
         }
@@ -138,19 +169,23 @@ impl Archive {
         None
     }
 
+    /// Returns the total number of bytes written across both forks
     fn extract_file(
         &self,
         f: &FileEntry,
         path: &Path,
         shared_blocks: &HashMap<usize, Vec<u8>>,
         offset_groups: &OffsetGroups,
-    ) -> Result<(), Error> {
+    ) -> Result<usize, Error> {
+        let mut written = 0usize;
+
         if f.comp_data > 0 {
             let data = self.decompress_fork(
                 f.data_offset, f.comp_data, f.uncomp_data,
                 f.block_data_off, shared_blocks, offset_groups,
             )?;
             fs::File::create(path)?.write_all(&data)?;
+            written = written.saturating_add(data.len());
         }
 
         if f.comp_rsrc > 0 && f.uncomp_rsrc > 0 {
@@ -158,9 +193,10 @@ impl Archive {
             let mut rsrc_path = path.as_os_str().to_owned();
             rsrc_path.push(".rsrc");
             fs::File::create(&rsrc_path)?.write_all(&data)?;
+            written = written.saturating_add(data.len());
         }
 
-        Ok(())
+        Ok(written)
     }
 
     /// Returns a borrowed slice from a pre-decompressed shared block, if this
@@ -271,6 +307,20 @@ impl Archive {
     }
 }
 
+/// Joins a cleaned entry name onto `base`, refusing any name that would escape
+/// it. `clean_name` already strips `..` and leading separators, so this is
+/// defense in depth and the single enforcement point for no traversal
+fn safe_join(base: &Path, name: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let escapes = Path::new(name)
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir));
+    if escapes {
+        return None;
+    }
+    Some(base.join(name))
+}
+
 fn clean_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for segment in name.split([':', '/']) {
@@ -284,4 +334,29 @@ fn clean_name(name: &str) -> String {
         out.push_str(s);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_name_neutralizes_traversal() {
+        assert_eq!(clean_name("../../etc/passwd"), "etc/passwd");
+        assert_eq!(clean_name("/etc/passwd"), "etc/passwd");
+        assert_eq!(clean_name("Macintosh HD:System:Prefs"), "Macintosh HD/System/Prefs");
+        assert_eq!(clean_name("a/../../b"), "a/b");
+        assert_eq!(clean_name(".."), "");
+        assert_eq!(clean_name("."), "");
+    }
+
+    #[test]
+    fn safe_join_rejects_escapes() {
+        let base = Path::new("/out");
+        assert_eq!(safe_join(base, "sub/file.txt"), Some(PathBuf::from("/out/sub/file.txt")));
+        // Defense in depth: even if a malformed name reaches here, it cannot escape
+        assert_eq!(safe_join(base, "../escape"), None);
+        assert_eq!(safe_join(base, "a/../b"), None);
+        assert_eq!(safe_join(base, "/abs/path"), None);
+    }
 }

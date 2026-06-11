@@ -18,6 +18,13 @@ use crate::Error;
 const EXPANSION_RATIO: usize = 20;
 /// Minimum output buffer headroom to avoid realloc on small inputs
 const MIN_HEADROOM: usize = 65536;
+/// Hard cap on output size relative to input when the uncompressed size is
+/// unknown. DEFLATE's theoretical maximum expansion is ~1032:1, so output
+/// beyond this is treated as a decompression bomb and rejected
+const MAX_EXPANSION_RATIO: usize = 1056;
+/// Longest DEFLATE back-reference: the final match may copy this far past
+/// `expected` before the trailing `truncate`, so the cap allows for it
+const MAX_MATCH: usize = 258;
 
 /// Substitution cipher shared across all observed VISE v3 versions.
 ///
@@ -74,8 +81,10 @@ pub fn decrypt_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Er
     let mut decrypted = src.to_vec();
     decrypt_in_place(&mut decrypted);
 
+    // `expected` is attacker-controlled; clamp its reservation to what this
+    // input could physically expand to so a bogus size can't request gigabytes
     let alloc = if expected > 0 {
-        expected + 1024
+        expected.saturating_add(1024).min(output_ceiling(src.len(), expected))
     } else {
         src.len() * EXPANSION_RATIO + MIN_HEADROOM
     };
@@ -114,13 +123,32 @@ pub fn decompress_raw_word_deflate(input: &[u8], expected: usize) -> Result<Vec<
     word_deflate(&swapped, expected)
 }
 
+/// Largest output `comp_len` compressed bytes could legitimately produce. A
+/// declared size (`expected > 0`) is trusted only up to this physical ceiling,
+/// so a lie in the header cannot enlarge the bound
+fn output_ceiling(comp_len: usize, expected: usize) -> usize {
+    let ratio_cap = comp_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .saturating_add(MIN_HEADROOM);
+    if expected > 0 {
+        expected.saturating_add(MAX_MATCH).min(ratio_cap)
+    } else {
+        ratio_cap
+    }
+}
+
 fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+    // Bound output growth so a crafted stream can't drive unbounded allocation
+    // (decompression bomb) or spin forever once the input is exhausted
+    let max_out = output_ceiling(input.len(), expected);
+
     let mut br = WordBitReader::new(input);
-    let mut out = Vec::with_capacity(expected);
+    let mut out = Vec::with_capacity(expected.min(max_out));
 
     loop {
         let bfinal = br.read_bits(1);
         let btype = br.read_bits(2);
+        let progress_mark = out.len();
 
         match btype {
             0 => {
@@ -132,6 +160,9 @@ fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
                         "stored block LEN/NLEN mismatch: {len} vs {nlen}"
                     )));
                 }
+                if out.len() + len > max_out {
+                    return Err(bomb_error(max_out));
+                }
                 for _ in 0..len {
                     #[allow(clippy::cast_possible_truncation)]
                     out.push(br.read_bits(8) as u8);
@@ -139,13 +170,22 @@ fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
                 // Odd stored length leaves us mid-word; realign before next block
                 br.align16();
             }
-            1 => decode_huffman_block(&mut br, &mut out, true)?,
-            2 => decode_huffman_block(&mut br, &mut out, false)?,
+            1 => decode_huffman_block(&mut br, &mut out, true, max_out)?,
+            2 => decode_huffman_block(&mut br, &mut out, false, max_out)?,
             _ => return Err(Error::Decompression(format!("invalid block type {btype}"))),
         }
 
         if bfinal != 0 {
             break;
+        }
+
+        // Reject empty non-final blocks: real compressors never emit them, but a
+        // crafted stream can chain them to force endless Huffman-table builds
+        // (CPU burn) without ever growing output to trip the size cap
+        if out.len() == progress_mark {
+            return Err(Error::Decompression(
+                "non-final block produced no output".into(),
+            ));
         }
     }
 
@@ -195,7 +235,10 @@ impl<'a> WordBitReader<'a> {
         self.ensure_bits(n);
         let val = self.bits & ((1u32 << n) - 1);
         self.bits >>= n;
-        self.nbits -= n;
+        // saturating: at end-of-input ensure_bits cannot supply `n` bits, so
+        // avoid underflowing nbits (which would panic in debug and wrap to a
+        // huge value in release, spinning the decoder)
+        self.nbits = self.nbits.saturating_sub(n);
         val
     }
 
@@ -270,7 +313,10 @@ fn decode_symbol(reader: &mut WordBitReader, table: &HuffmanTable) -> Result<u32
     #[allow(clippy::cast_possible_truncation)]
     let peek = (reader.bits & (TABLE_SIZE as u32 - 1)) as usize;
     let (sym, len) = table.entries[peek];
-    if len > 0 {
+    // Require the matched code to fit within the bits actually read from input.
+    // At end-of-input ensure_bits pads with zeros; without this check a truncated
+    // stream would decode phantom symbols forever and underflow nbits.
+    if len > 0 && u32::from(len) <= reader.nbits {
         reader.bits >>= len;
         reader.nbits -= u32::from(len);
         return Ok(u32::from(sym));
@@ -291,10 +337,17 @@ static FIXED_DIST: LazyLock<HuffmanTable> = LazyLock::new(|| {
     build_huffman_table(&[5u8; 32])
 });
 
+fn bomb_error(max_out: usize) -> Error {
+    Error::Decompression(format!(
+        "output exceeds {max_out} byte limit (possible decompression bomb)"
+    ))
+}
+
 fn decode_huffman_block(
     reader: &mut WordBitReader,
     out: &mut Vec<u8>,
     fixed: bool,
+    max_out: usize,
 ) -> Result<(), Error> {
     let (dyn_lit, dyn_dist);
     let (lit_table, dist_table) = if fixed {
@@ -312,6 +365,9 @@ fn decode_huffman_block(
             break;
         }
         if sym < 256 {
+            if out.len() >= max_out {
+                return Err(bomb_error(max_out));
+            }
             #[allow(clippy::cast_possible_truncation)]
             out.push(sym as u8);
         } else {
@@ -323,6 +379,9 @@ fn decode_huffman_block(
                     "back-reference distance {distance} exceeds output length {}",
                     out.len()
                 )));
+            }
+            if out.len() + length > max_out {
+                return Err(bomb_error(max_out));
             }
             if distance >= length {
                 let start = out.len() - distance;
@@ -421,6 +480,49 @@ fn decode_distance(reader: &mut WordBitReader, sym: u32) -> Result<usize, Error>
 mod tests {
     use super::*;
 
+    /// Deflates `raw` with no zlib header. Without stored blocks the output is
+    /// bit-identical to what `WordBitReader` expects, so it round-trips through
+    /// `word_deflate`
+    fn raw_deflate(raw: &[u8]) -> Vec<u8> {
+        let mut comp = flate2::Compress::new(flate2::Compression::best(), false);
+        let mut out = vec![0u8; raw.len() + 4096];
+        comp.compress(raw, &mut out, flate2::FlushCompress::Finish).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        out.truncate(comp.total_out() as usize);
+        out
+    }
+
+    #[test]
+    fn output_cap_rejects_bomb() {
+        // 200 KB of zeros deflates to a tiny stream. With expected = 1 the cap is
+        // 1 + MAX_MATCH, so the expansion must be rejected, not allocated
+        let compressed = raw_deflate(&vec![0u8; 200_000]);
+        let Err(Error::Decompression(msg)) = word_deflate(&compressed, 1) else {
+            panic!("expected a decompression-bomb error");
+        };
+        assert!(msg.contains("bomb"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn empty_nonfinal_block_is_rejected() {
+        // bfinal=0, btype=0 (stored), then a zero-length stored block: produces
+        // no output. The forward-progress guard must reject it so a stream can't
+        // chain empty blocks to burn CPU without tripping the size cap
+        let input = [0x00, 0x00, 0x00, 0x00, 0xff, 0xff];
+        let Err(Error::Decompression(msg)) = word_deflate(&input, 0) else {
+            panic!("expected a decompression error");
+        };
+        assert!(msg.contains("no output"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn output_cap_allows_legitimate_expansion() {
+        // The same payload decodes cleanly when the expected size leaves room
+        let raw = vec![0u8; 200_000];
+        let compressed = raw_deflate(&raw);
+        assert_eq!(word_deflate(&compressed, raw.len()).unwrap(), raw);
+    }
+
     #[test]
     fn decrypt_swaps_and_ciphers() {
         let mut buf = vec![0x00, 0x01, 0x02, 0x03];
@@ -482,5 +584,17 @@ mod tests {
         let result = decompress_raw_word_deflate(&BODY, 0).unwrap();
         assert_eq!(result.len(), 432);
         assert_eq!(&result[0..4], b"FVCT");
+    }
+
+    #[test]
+    fn truncated_stream_errors_instead_of_spinning() {
+        // The same valid CVCT body cut off mid-stream. Before the EOF guards a
+        // truncated stream could decode phantom symbols until it filled the
+        // output cap (or panicked in debug); now it must terminate with an Err.
+        const BODY: [u8; 32] = [
+            0x90, 0xcd, 0x0a, 0xbd, 0x60, 0x82, 0x86, 0x14, 0x4f, 0xdf, 0x24, 0x2d, 0xba, 0x0c, 0xdb, 0x04,
+            0x08, 0x2b, 0xa5, 0xa1, 0x7f, 0xc5, 0x41, 0x11, 0xa2, 0x3f, 0x03, 0x1a, 0x25, 0xa1, 0x86, 0x92,
+        ];
+        assert!(decompress_raw_word_deflate(&BODY, 0).is_err());
     }
 }

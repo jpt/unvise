@@ -9,6 +9,12 @@ use crate::Error;
 const WIN_SIZE: usize = 1024;
 const WIN_MASK: usize = WIN_SIZE - 1;
 
+/// Each back-reference encodes at most a 65-byte match from 2 input bytes, so
+/// LZSS can't expand by more than ~33x. Bounds the up-front capacity reservation
+/// against an attacker-inflated `expected` size
+const MAX_EXPANSION_RATIO: usize = 64;
+const MIN_HEADROOM: usize = 65536;
+
 /// Decompresses LZSS-encoded data, returning exactly `expected` bytes
 ///
 /// Returns the input unchanged when its length already matches `expected`
@@ -22,9 +28,14 @@ pub fn decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
         return Ok(src.to_vec());
     }
 
+    // Cap the reservation by what the input could expand to; the loop still
+    // stops at `expected`, so this only limits the up-front allocation
+    let reserve_cap = src.len()
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .saturating_add(MIN_HEADROOM);
     let mut window = [0u8; WIN_SIZE];
     let mut wp = 0usize;
-    let mut out = Vec::with_capacity(expected);
+    let mut out = Vec::with_capacity(expected.min(reserve_cap));
     let mut pos = 0usize;
 
     while pos < src.len() && out.len() < expected {
