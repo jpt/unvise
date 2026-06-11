@@ -232,6 +232,18 @@ fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, TagKind)> {
 /// pairs gives a robust answer. For single-record archives (only one tag of a
 /// given type), falls back to using the next tag of any type as a stride bound.
 fn infer_name_off(data: &[u8], tags: &[(usize, TagKind)], target: TagKind, nlen_off: usize) -> usize {
+    // Precompute each index's next same-type tag in one reverse pass. A naive
+    // inner search is O(tags^2), which a body densely packed with markers
+    // (post-decompression, attacker-influenced) could exploit to stall the parser
+    let mut next_same_pos = vec![None; tags.len()];
+    let mut seen: Option<usize> = None;
+    for i in (0..tags.len()).rev() {
+        next_same_pos[i] = seen;
+        if tags[i].1 == target {
+            seen = Some(tags[i].0);
+        }
+    }
+
     let mut votes: Vec<(usize, usize)> = Vec::new();
 
     for i in 0..tags.len().saturating_sub(1) {
@@ -240,8 +252,7 @@ fn infer_name_off(data: &[u8], tags: &[(usize, TagKind)], target: TagKind, nlen_
             continue;
         }
         // Prefer stride to next same-type tag; fall back to next tag of any type
-        let next_same = tags[i + 1..].iter().find(|(_, k)| *k == target);
-        let stride_to = next_same.map_or(tags[i + 1].0, |&(p, _)| p);
+        let stride_to = next_same_pos[i].unwrap_or(tags[i + 1].0);
         let stride = stride_to - pos;
         if pos + nlen_off >= data.len() {
             continue;
