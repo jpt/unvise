@@ -8,7 +8,7 @@
 
 #![warn(clippy::pedantic)]
 
-pub mod deflate;
+pub(crate) mod deflate;
 pub(crate) mod lzss;
 pub mod macbinary;
 mod parse;
@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 pub use parse::{ArchiveInfo, Entry, FileEntry};
 
 /// How far total extracted output may exceed the archive size before extraction
-/// aborts. DEFLATE can't expand by more than ~1032:1, so legitimate output stays
-/// well under this; anything beyond is a bomb
-const OUTPUT_BUDGET_RATIO: usize = 1056;
+/// aborts. DEFLATE's exact maximum expansion is 1032:1, so legitimate output
+/// stays well under this; anything beyond is a bomb
+const OUTPUT_BUDGET_RATIO: usize = 1032;
 /// Floor for the output budget so tiny archives still extract normally
 const OUTPUT_BUDGET_HEADROOM: usize = 1 << 20;
 
@@ -290,7 +290,21 @@ impl Archive {
             return blocks;
         }
 
-        for (&off, indices) in offset_groups {
+        // bound the resident size of the whole cache, not just each block: a
+        // crafted archive could otherwise pin many large shared blocks in memory
+        // at once. Once the budget is hit, the rest decode per-entry on demand
+        let budget = self.data.len()
+            .saturating_mul(OUTPUT_BUDGET_RATIO)
+            .saturating_add(OUTPUT_BUDGET_HEADROOM);
+        let mut resident: usize = 0;
+
+        // iterate in offset order, not HashMap order, so which blocks land in the
+        // cache before the budget is hit is deterministic across runs
+        let mut offsets: Vec<usize> = offset_groups.keys().copied().collect();
+        offsets.sort_unstable();
+
+        for off in offsets {
+            let indices = &offset_groups[&off];
             if indices.len() <= 1 {
                 continue;
             }
@@ -299,6 +313,11 @@ impl Archive {
                 continue;
             }
             if let Ok(data) = deflate::decrypt_and_decompress(&self.data[off..off + cd], 0) {
+                if resident.saturating_add(data.len()) > budget {
+                    eprintln!("  shared-block cache hit {budget} byte budget; remaining blocks decode on demand");
+                    break;
+                }
+                resident = resident.saturating_add(data.len());
                 blocks.insert(off, data);
             }
         }

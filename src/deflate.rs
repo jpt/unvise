@@ -7,24 +7,30 @@
 //! (using `bits & 0xf` rather than standard zlib's `bits & 0x7`)
 //!
 //! For streams without stored blocks the output is bit-identical to standard
-//! DEFLATE, so we try flate2 first and fall back to the custom word-aligned
-//! decoder only when needed
+//! DEFLATE, so flate2 is the fast path and the custom word-aligned decoder is
+//! the fallback, used only when flate2 can't handle a stream
 
 use std::sync::LazyLock;
 
 use crate::Error;
 
-/// Typical worst-case expansion for VISE shared blocks (~10-20x observed)
-const EXPANSION_RATIO: usize = 20;
-/// Minimum output buffer headroom to avoid realloc on small inputs
+/// Headroom added to the ratio ceiling so tiny inputs aren't capped below what
+/// they legitimately decompress to
 const MIN_HEADROOM: usize = 65536;
-/// Hard cap on output size relative to input when the uncompressed size is
-/// unknown. DEFLATE's theoretical maximum expansion is ~1032:1, so output
-/// beyond this is treated as a decompression bomb and rejected
-const MAX_EXPANSION_RATIO: usize = 1056;
-/// Longest DEFLATE back-reference: the final match may copy this far past
-/// `expected` before the trailing `truncate`, so the cap allows for it
+/// Hard cap on output size relative to input: DEFLATE's exact maximum expansion.
+/// A 258-byte match (the longest back-reference) can be encoded in as little as
+/// 2 bits, so 258*8/2 = 1032 bytes out per byte in. No valid stream exceeds this,
+/// so anything past it is a decompression bomb
+const MAX_EXPANSION_RATIO: usize = 1032;
+/// Longest DEFLATE back-reference (max match length). The final match of a
+/// stream may copy this far past `expected` before the trailing `truncate`, so
+/// the cap adds it as slack
 const MAX_MATCH: usize = 258;
+/// Output chunk pulled from flate2 per iteration when decompressing incrementally
+const INFLATE_CHUNK: usize = 64 * 1024;
+/// Starting output capacity. A growth hint only, never sized from the declared
+/// `expected`, so a bogus header can't request a huge reservation up front
+const INITIAL_OUTPUT_CAP: usize = 1 << 20;
 
 /// Substitution cipher shared across all observed VISE v3 versions.
 ///
@@ -80,29 +86,66 @@ pub fn decrypt_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Er
     let mut decrypted = src.to_vec();
     decrypt_in_place(&mut decrypted);
 
-    // `expected` is attacker-controlled; clamp its reservation to what this
-    // input could physically expand to so a bogus size can't request gigabytes
-    let alloc = if expected > 0 {
-        expected.saturating_add(1024).min(output_ceiling(src.len(), expected))
-    } else {
-        src.len() * EXPANSION_RATIO + MIN_HEADROOM
-    };
-    let mut buf = vec![0u8; alloc];
-    let mut decomp = flate2::Decompress::new(false);
+    match inflate(&decrypted, expected) {
+        Some(out) => Ok(out),
+        // word-aligned stored blocks defeat standard inflate; the custom decoder
+        // handles those and applies the same output bound
+        None => word_deflate(&decrypted, expected),
+    }
+}
 
-    if let Ok(flate2::Status::StreamEnd) =
-        decomp.decompress(&decrypted, &mut buf, flate2::FlushDecompress::Finish)
-    {
-        // total_out is u64; VISE archives are well under 4 GB
+/// Standard DEFLATE via flate2, pulled in fixed chunks so the output bound is
+/// enforced as bytes are produced and no buffer is ever sized from the
+/// attacker-controlled `expected`. Returns `None` to signal the caller should
+/// fall back to the word-aligned decoder: flate2 declined the stream, stalled,
+/// the output ran past what the input could legitimately produce, or it did not
+/// yield exactly `expected` bytes
+fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let max_out = output_ceiling(input.len(), expected);
+    let mut out = Vec::with_capacity(INITIAL_OUTPUT_CAP.min(max_out));
+    let mut scratch = vec![0u8; INFLATE_CHUNK];
+    let mut dec = flate2::Decompress::new(false);
+
+    loop {
+        let in_before = dec.total_in();
+        let out_before = dec.total_out();
         #[allow(clippy::cast_possible_truncation)]
-        let n = decomp.total_out() as usize;
-        if expected == 0 || n == expected {
-            buf.truncate(n);
-            return Ok(buf);
+        let status = dec.decompress(
+            &input[in_before as usize..],
+            &mut scratch,
+            flate2::FlushDecompress::None,
+        );
+        // total_in/total_out are u64; VISE archives are well under 4 GB
+        #[allow(clippy::cast_possible_truncation)]
+        let produced = (dec.total_out() - out_before) as usize;
+        out.extend_from_slice(&scratch[..produced]);
+
+        // beyond what this input could legitimately expand to: a bomb, bail out
+        if out.len() > max_out {
+            return None;
+        }
+
+        match status {
+            Ok(flate2::Status::StreamEnd) => break,
+            Ok(_) => {
+                #[allow(clippy::cast_possible_truncation)]
+                let consumed = (dec.total_in() - in_before) as usize;
+                // no input taken and no output made: stalled (e.g. truncated stream)
+                if consumed == 0 && produced == 0 {
+                    return None;
+                }
+            }
+            Err(_) => return None,
         }
     }
 
-    word_deflate(&decrypted, expected)
+    // accept only an exact match (or an unknown size); a short or long result
+    // defers to the word-aligned decoder, preserving the prior fall-back behavior
+    if expected == 0 || out.len() == expected {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Decompresses raw word-aligned DEFLATE without the byte-swap + cipher layer.
@@ -520,6 +563,33 @@ mod tests {
         let raw = vec![0u8; 200_000];
         let compressed = raw_deflate(&raw);
         assert_eq!(word_deflate(&compressed, raw.len()).unwrap(), raw);
+    }
+
+    #[test]
+    fn inflate_roundtrips_across_chunks() {
+        // ~200 KB output spans several INFLATE_CHUNK iterations, with a size that
+        // is not a chunk multiple, exercising the incremental loop boundaries
+        let raw: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let compressed = raw_deflate(&raw);
+        assert_eq!(inflate(&compressed, raw.len()).unwrap(), raw);
+        // the unknown-size (shared-block) path returns everything as well
+        assert_eq!(inflate(&compressed, 0).unwrap(), raw);
+    }
+
+    #[test]
+    fn inflate_bails_on_bomb() {
+        // 200 KB of zeros -> tiny stream; with expected = 1 the ceiling is ~259,
+        // so the chunk loop stops and signals fall-back rather than expanding
+        let compressed = raw_deflate(&vec![0u8; 200_000]);
+        assert!(inflate(&compressed, 1).is_none());
+    }
+
+    #[test]
+    fn inflate_bails_on_truncated_stream() {
+        let raw = vec![7u8; 100_000];
+        let mut compressed = raw_deflate(&raw);
+        compressed.truncate(compressed.len() / 2);
+        assert!(inflate(&compressed, raw.len()).is_none());
     }
 
     #[test]
