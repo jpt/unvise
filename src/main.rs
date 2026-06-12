@@ -5,6 +5,10 @@ use unvise::{Archive, Entry};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("unvise {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.len() < 2 {
         eprintln!("usage: {} <vise_installer> [output_dir]", args[0]);
         eprintln!();
