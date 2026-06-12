@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn infer_name_off_multi_record() {
-        // Two FVCT records each 200 bytes apart, name_len=6 → name_off = 194
+        // Two FVCT records 200 bytes apart, name_len=6, so name_off = 194
         let mut data = vec![0u8; 406];
         data[0..4].copy_from_slice(b"FVCT");
         data[FVCT_NLEN] = 6;
@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn infer_name_off_single_record_cross_type_fallback() {
-        // Single FVCT followed by a different tag type — forces cross-type
+        // Single FVCT followed by a different tag type, forcing the cross-type
         // stride fallback (no consecutive same-type tags to vote on)
         let mut data = vec![0u8; 230];
         data[0..4].copy_from_slice(b"FVCT");
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn infer_name_off_default_fallback() {
-        // Single tag, no next tag → falls back to nlen_off + 2
+        // Single tag, no next tag, so it falls back to nlen_off + 2
         let mut data = vec![0u8; 200];
         data[0..4].copy_from_slice(b"FVCT");
         data[FVCT_NLEN] = 4;
@@ -405,5 +405,46 @@ mod tests {
         assert_eq!(tags.len(), 1);
         let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
         assert_eq!(off, FVCT_NLEN + 2);
+    }
+
+    /// Minimal v3 archive whose CVCT directory is flagged compressed: `body` is
+    /// the raw compressed-directory bytes, `declared` the body-size field (so a
+    /// caller can lie about it)
+    fn compressed_cvct(body: &[u8], declared: u32) -> Vec<u8> {
+        let cvct = 0x80usize;
+        let comp_start = cvct + NEWSTYLE_CVCT_BODY;
+        let mut buf = vec![0u8; comp_start + body.len()];
+        buf[0..4].copy_from_slice(b"SVCT");
+        buf[0x12] = 0x03;
+        buf[0x14..0x18].copy_from_slice(&1u32.to_be_bytes());
+        buf[0x24..0x28].copy_from_slice(&u32::try_from(cvct).unwrap().to_be_bytes());
+        buf[cvct..cvct + 4].copy_from_slice(b"CVCT");
+        buf[cvct + 4..cvct + 8].copy_from_slice(&declared.to_be_bytes());
+        let flag = cvct + NEWSTYLE_CVCT_COMPRESSED;
+        buf[flag..flag + 4].copy_from_slice(&1u32.to_be_bytes());
+        buf[cvct + 0x14..cvct + 0x18].copy_from_slice(b"PACK");
+        buf[comp_start..].copy_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn parse_rejects_oversized_cvct_body() {
+        // body-size field points past the archive; without the bounds check the
+        // `data[comp_start..comp_end]` slice would panic
+        assert!(parse(&compressed_cvct(&[0xAB; 8], 0xFFFF)).is_err());
+    }
+
+    #[test]
+    fn parse_survives_garbage_cvct_body() {
+        // a non-DEFLATE compressed directory errors cleanly, never panics or hangs
+        assert!(parse(&compressed_cvct(&[0xFF; 64], 64)).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_cvct_pointer_past_end() {
+        let mut buf = vec![0u8; 0x40];
+        buf[0..4].copy_from_slice(b"SVCT");
+        buf[0x24..0x28].copy_from_slice(&0xFFFFu32.to_be_bytes());
+        assert!(parse(&buf).is_err());
     }
 }

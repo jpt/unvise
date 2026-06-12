@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.5
+
+### Added
+- `--version` / `-V` flag
+
+### Security
+- Bound the total memory of all decompressed shared blocks (not just each block), so a crafted archive can't hold many large blocks in memory at once
+
+### Changed
+- Decompress in chunks and never allocate from the archive's declared size, so a small file can't force a huge buffer (output unchanged)
+- Cap decompression at each format's exact maximum expansion (DEFLATE 1032:1, LZSS ~33:1)
+- Strip a MacBinary wrapper only when the data under it actually starts with SVCT
+- Decode shared blocks in a fixed order, so extraction is identical run to run
+- `deflate` is no longer a public module
+
 ## 0.1.4
 
 ### Security

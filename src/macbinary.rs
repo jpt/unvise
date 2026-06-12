@@ -14,17 +14,20 @@ pub fn strip(data: Vec<u8>) -> Vec<u8> {
         return data;
     }
 
-    // MacBinary: byte 0 is zero, byte 1 is filename length (1..63),
-    // and the data at offset 65 is NOT already an SVCT tag
+    // MacBinary: byte 0 zero, byte 1 a filename length (1..63), and an SVCT tag
+    // at offset 128, all required to strip a wrapper so a stray header match
+    // can't mis-strip a non-VISE file
     let name_len = data[1];
-    if data[0] != 0 || !(1..=63).contains(&name_len) || &data[65..69] == b"SVCT" {
-        return data;
-    }
-
     let data_len = u32::from_be_bytes([data[83], data[84], data[85], data[86]]) as usize;
-    if data_len == 0 || 128 + data_len > data.len() {
-        return data;
-    }
+    let wrapped = data[0] == 0
+        && (1..=63).contains(&name_len)
+        && data_len != 0
+        && 128 + data_len <= data.len()
+        && data.get(128..132) == Some(b"SVCT".as_slice());
 
-    data[128..128 + data_len].to_vec()
+    if wrapped {
+        data[128..128 + data_len].to_vec()
+    } else {
+        data
+    }
 }
