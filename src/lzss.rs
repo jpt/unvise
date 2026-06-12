@@ -9,10 +9,11 @@ use crate::Error;
 const WIN_SIZE: usize = 1024;
 const WIN_MASK: usize = WIN_SIZE - 1;
 
-/// Each back-reference encodes at most a 65-byte match from 2 input bytes, so
-/// LZSS can't expand by more than ~33x. Bounds the up-front capacity reservation
-/// against an attacker-inflated `expected` size
-const MAX_EXPANSION_RATIO: usize = 64;
+/// LZSS's maximum expansion: a 2-byte back-reference token copies at most a
+/// 65-byte match (6-bit length field, +2), so 65/2 = 32.5, rounded up to 33.
+/// Bounds the up-front capacity reservation against an attacker-inflated
+/// `expected` size
+const MAX_EXPANSION_RATIO: usize = 33;
 const MIN_HEADROOM: usize = 65536;
 
 /// Decompresses LZSS-encoded data, returning exactly `expected` bytes
