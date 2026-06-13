@@ -21,6 +21,25 @@ use std::path::{Path, PathBuf};
 
 pub use parse::{ArchiveInfo, Entry, FileEntry};
 
+/// Decompression internals re-exported for the fuzz targets under the `fuzzing`
+/// feature only, not public API
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::deflate::decrypt_and_decompress;
+    pub use crate::deflate::word_deflate;
+    pub use crate::lzss::decompress as lzss_decompress;
+
+    use std::path::{Path, PathBuf};
+
+    /// Runs the real name sanitizer then the join guard, the way `extract` does,
+    /// so a fuzz target can assert the pipeline never escapes the base
+    pub fn sanitize_and_join(base: &Path, raw: &str) -> Option<PathBuf> {
+        let cleaned = super::clean_name(raw);
+        super::safe_join(base, &cleaned)
+    }
+}
+
 /// How far total extracted output may exceed the archive size before extraction
 /// aborts. DEFLATE's exact maximum expansion is 1032:1, so legitimate output
 /// stays well under this; anything beyond is a bomb

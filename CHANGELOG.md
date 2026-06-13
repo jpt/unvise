@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+### Added
+- cargo-fuzz harness over the untrusted-input surface. `fuzzing` feature is off by default. Six targets: `parse`, `deflate`, `lzss`, `macbinary`, `word_deflate` (word aligned DEFLATE decoder, no cipher layer), and `name_sanitizer` (the `clean_name` then `safe_join` path traversal guard). All ran clean: no panic, OOM, or hang
+
 ## 0.1.5
 
 ### Added
