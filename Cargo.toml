@@ -1,6 +1,6 @@
 [package]
 name = "unvise"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -13,3 +13,8 @@ readme = "README.md"
 [dependencies]
 flate2 = "1"
 thiserror = "2"
+
+[features]
+# Exposes decompression internals to the fuzz targets in fuzz/. Off by default,
+# so the normal build and public API stay unchanged.
+fuzzing = []

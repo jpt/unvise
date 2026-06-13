@@ -179,7 +179,7 @@ fn output_ceiling(comp_len: usize, expected: usize) -> usize {
     }
 }
 
-fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     // Bound output growth so a crafted stream can't drive unbounded allocation
     // (decompression bomb) or spin forever once the input is exhausted
     let max_out = output_ceiling(input.len(), expected);
