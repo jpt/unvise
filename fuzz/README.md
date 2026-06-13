@@ -70,18 +70,18 @@ Measured 2026-06-13 by replaying each target corpus through a
 | `macbinary.rs`|  0.0%  |  0.0% | wrapper path, covered by the `macbinary` target   |
 
 A file reading as cold under `parse` is expected: each target drives one entry
-point, so cross file coverage comes from the matching target, not from `parse`.
-The figures that matter for `parse`, parser and decompression of the directory,
-are strong
+point, so coverage of another file comes from its own target, not from `parse`.
+For `parse` itself, the parser and the decompression of the directory are well
+covered
 
-The `parse` corpus left two security relevant spots cold, each now covered by a
-direct target:
+Two paths warrant their own targets because the others reach them only
+incidentally:
 
-- `word_deflate` stored block handling and `deflate.rs` error branches. The v3
-  archive corpus rarely produces word aligned stored blocks, so the `deflate`
-  target seldom reaches them. The `word_deflate` target drives the decoder
-  directly, with no cipher layer in front
-- `safe_join` and `clean_name` in `lib.rs`. These guard path traversal but sit
-  behind `extract()`, which the other targets do not call. The `name_sanitizer`
-  target runs the real `clean_name` then `safe_join` pipeline on arbitrary bytes
-  and asserts the result can never escape the output base
+- `word_deflate` exercises word-aligned stored blocks and the `deflate.rs` error
+  branches. The cipher in front of `decrypt_and_decompress` means the `deflate`
+  corpus rarely deciphers into valid stored blocks, so `word_deflate` drives the
+  decoder with no cipher in front
+- `clean_name` and `safe_join` guard path traversal but sit behind `extract()`,
+  which no other target calls. `name_sanitizer` runs the `clean_name` then
+  `safe_join` pipeline on arbitrary bytes and checks the result cannot escape the
+  base
