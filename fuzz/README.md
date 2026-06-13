@@ -1,6 +1,6 @@
 # Fuzzing unvise
 
-Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer + ASan). The fuzz profile enables `overflow-checks` and `debug-assertions`, so integer overflow and `debug_assert!`s surface as crashes. Invariant for every target: no panic, no OOM, no hang on any input.
+Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer + ASan). The fuzz profile enables `overflow-checks` and `debug-assertions`, so integer overflow and `debug_assert!`s surface as crashes. Invariant for every target: no panic, no OOM, no hang on any input
 
 | Target           | Entry point                                                         |
 |------------------|---------------------------------------------------------------------|
@@ -73,14 +73,8 @@ point, so coverage of another file comes from its own target, not from `parse`.
 For `parse` itself, the parser and the decompression of the directory are well
 covered
 
-Two paths warrant their own targets because the others reach them only
-incidentally:
+`name_sanitizer` covers a path the others miss; `word_deflate` sharpens one they
+already reach:
 
-- `word_deflate` exercises word-aligned stored blocks and the `deflate.rs` error
-  branches. The cipher in front of `decrypt_and_decompress` means the `deflate`
-  corpus rarely deciphers into valid stored blocks, so `word_deflate` drives the
-  decoder with no cipher in front
-- `clean_name` and `safe_join` guard path traversal but sit behind `extract()`,
-  which no other target calls. `name_sanitizer` runs the `clean_name` then
-  `safe_join` pipeline on arbitrary bytes and checks the result cannot escape the
-  base
+- `clean_name` and `safe_join` guard against path traversal but sit behind `extract()`, which no other target calls. `name_sanitizer` runs them on arbitrary names and checks the result cannot escape the output folder
+- `word_deflate` runs the decoder on its own, without the cipher step in front. The `parse` target already reaches it through real archive directories, so this one mainly pins down the error-handling corners
