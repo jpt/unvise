@@ -1,0 +1,12 @@
+# libFuzzer dictionary: VISE chunk and record tags, so the fuzzer reaches past the header check
+"SVCT"
+"CVCT"
+"FVCT"
+"DVCT"
+"PACK"
+"BBrd"
+"CODE"
+"BDIR"
+"PROJ"
+"INDN"
+"DfIl"
