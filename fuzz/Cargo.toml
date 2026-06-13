@@ -1,0 +1,66 @@
+[package]
+name = "unvise-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.unvise]
+path = ".."
+features = ["fuzzing"]
+
+# Standalone workspace so the parent crate's build graph is untouched
+[workspace]
+
+[profile.release]
+debug = 1
+# surface overflow and debug_assert!s as crashes, not silent wraps
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deflate"
+path = "fuzz_targets/deflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lzss"
+path = "fuzz_targets/lzss.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macbinary"
+path = "fuzz_targets/macbinary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "word_deflate"
+path = "fuzz_targets/word_deflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "name_sanitizer"
+path = "fuzz_targets/name_sanitizer.rs"
+test = false
+doc = false
+bench = false
