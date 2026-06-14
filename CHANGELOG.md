@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.8
+
+### Added
+- `archive` fuzz target covering the full parse-through-decompress pipeline (shared-block cache, offset groups, fork slicing) without filesystem I/O
+
+### Fixed
+- `decompress_raw` bounds check uses `checked_add` to prevent theoretical `usize` overflow on offset + length
+
 ## 0.1.7
 
 ### Added
