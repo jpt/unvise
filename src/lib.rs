@@ -36,6 +36,37 @@ pub mod fuzzing {
         let cleaned = super::clean_name(raw);
         super::safe_join(base, &cleaned)
     }
+
+    /// Parses a VISE archive and decompresses all entries, exercising
+    /// shared-block caching, offset groups, and fork slicing without
+    /// filesystem I/O
+    pub fn parse_and_decompress(data: &[u8]) {
+        let archive = match super::Archive::parse(data.to_vec()) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let files: Vec<_> = archive.info.entries.iter()
+            .filter_map(super::Entry::as_file)
+            .collect();
+        let offset_groups = archive.build_offset_groups(&files);
+        let shared_blocks = archive.decompress_shared_blocks(&files, &offset_groups);
+        for entry in &archive.info.entries {
+            if let super::Entry::File(f) = entry {
+                if archive.skip_reason(f, &shared_blocks).is_some() {
+                    continue;
+                }
+                if f.comp_data > 0 {
+                    let _ = archive.decompress_fork(
+                        f.data_offset, f.comp_data, f.uncomp_data,
+                        f.block_data_off, &shared_blocks, &offset_groups,
+                    );
+                }
+                if f.comp_rsrc > 0 && f.uncomp_rsrc > 0 {
+                    let _ = archive.decompress_rsrc(f, &shared_blocks, &offset_groups);
+                }
+            }
+        }
+    }
 }
 
 /// How far total extracted output may exceed the archive size before extraction
@@ -270,12 +301,12 @@ impl Archive {
     }
 
     fn decompress_raw(&self, offset: usize, comp: usize, uncomp: usize) -> Result<Vec<u8>, Error> {
-        if offset + comp > self.data.len() {
-            return Err(Error::Decompression(format!(
+        let end = offset.checked_add(comp).filter(|&e| e <= self.data.len()).ok_or_else(|| {
+            Error::Decompression(format!(
                 "data at 0x{offset:x} ({comp} bytes) exceeds archive bounds"
-            )));
-        }
-        let src = &self.data[offset..offset + comp];
+            ))
+        })?;
+        let src = &self.data[offset..end];
         deflate::decrypt_and_decompress(src, uncomp)
     }
 

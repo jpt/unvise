@@ -55,7 +55,7 @@ pub const CIPHER: [u8; 256] = [
     0x86, 0xdd, 0x5f, 0x42, 0xd3, 0x02, 0x61, 0x95, 0x0c, 0x5c, 0xa5, 0xcd, 0xc0, 0x07, 0xe2, 0xf3,
 ];
 
-/// Applies the VISE obfuscation layer in place.
+/// Applies the VISE obfuscation layer in place
 ///
 /// Adjacent byte pairs are swapped, then each byte is substituted through the
 /// cipher table. This transformation precedes DEFLATE decompression in all
@@ -149,7 +149,7 @@ fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Decompresses raw word-aligned DEFLATE without the byte-swap + cipher layer.
+/// Decompresses raw word-aligned DEFLATE without the byte-swap + cipher layer
 ///
 /// Used for v3.08+ CVCT bodies where the directory is compressed but not
 /// encrypted. The raw bytes are byte-pair swapped to match `WordBitReader`'s
