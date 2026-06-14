@@ -4,12 +4,14 @@ Extracts files from Mac-based Installer VISE archives, the installer format crea
 
 ## Supported versions
 
-| Format bytes | Compression | Notes |
-|---|---|---|
-| 00 01, 02 0x | LZSS | Earliest versions |
-| 03 00 - 03 05 | Cipher + DEFLATE | Word-aligned DEFLATE with substitution cipher |
-| 03 06 - 03 07 | Cipher + DEFLATE | New CVCT header with chunk-type table |
-| 03 08 - 03 0e | Cipher + DEFLATE | CVCT body is compressed |
+| Format bytes | Notes |
+|---|---|
+| 00 01, 02 0x | Standard DEFLATE; no shared-block slicing |
+| 03 00 - 03 05 | Word-aligned DEFLATE; shared-block slicing |
+| 03 06 - 03 07 | New CVCT header with chunk-type table |
+| 03 08 - 03 0e | CVCT body is compressed |
+
+All versions use the same byte-swap + substitution cipher + DEFLATE pipeline. The v3 DEFLATE variant aligns stored blocks to 16-bit word boundaries
 
 The format version is at bytes 0x12-0x13 of the SVCT header. These are archive format versions, not product versions. The highest format version tested was 03 0e, from Installer VISE 8.5 (July 2005)
 
@@ -75,17 +77,37 @@ VISE archives are structured around four chunk types:
 
 ### Compression
 
-**v2 (LZSS):** A 1024-byte circular window with 10-bit absolute position references and 6-bit match lengths (minimum 2). Flag bytes are MSB-first: 0 = literal, 1 = back-reference
+All observed VISE versions use the same obfuscation layer: adjacent byte pairs are swapped, then each byte passes through a 256-byte substitution cipher. The decrypted result is standard DEFLATE.
 
-**v3 (Cipher + DEFLATE):** Data passes through a byte-pair swap, then a 256-byte substitution cipher, then DEFLATE decompression. The DEFLATE variant aligns stored blocks to 16-bit word boundaries rather than byte boundaries, a consequence of the decompressor's word-based bitstream reader
+The v3 decompressor (PPC Dcmp 1005) reads bits from big-endian 16-bit words and aligns stored blocks to word boundaries (`bits & 0xf` instead of zlib's `bits & 0x7`). For streams without stored blocks the output is bit-identical to standard DEFLATE, so the fast path uses flate2/zlib and only falls back to the custom word-aligned decoder when needed.
+
+### Shared compressed blocks
+
+Multiple FVCT entries can share the same `data_offset`, meaning their forks are packed into a single compressed block. Each entry's `block_data_off` / `block_rsrc_off` fields give the byte offset within the decompressed block where that entry's fork starts. The actual compressed size is the maximum `comp_data` across all entries sharing the offset.
+
+In v2 archives, `block_data_off` contains garbage values; shared-block slicing is skipped and each entry is decompressed individually.
 
 ### Multi-segment installers
 
-Some format 3 installers span multiple disks. The SVCT header at offset 0x14 records the total segment count, and each FVCT entry has a segment number at offset +98. Files from segments not present in the provided file are reported as skipped
+Some format 3 installers span multiple disks. The SVCT header at offset 0x14 records the total segment count, and each FVCT entry has a segment number at offset +98. Files on segment 0 are stored on the distribution media (e.g. a CD), not in the installer archive itself. Files from segments not present in the provided file are reported as skipped
 
 ### Condition records
 
 Entries with bit 27 set in the flags field (offset FVCT+12) are not files; they encode installer conditions (platform checks, optional component toggles). These are reported in output but not extracted
+
+## Testing
+
+Unit tests cover the decompression pipeline, parser, and safety checks:
+
+```sh
+cargo test
+```
+
+An optional integration test downloads public VISE samples from [sembiance.com](https://sembiance.com/fileFormatSamples/archive/installerVISE/), extracts each one, and verifies content against known-good SHA-256 hashes. Downloads are cached in `target/corpus/`. Requires network access:
+
+```sh
+cargo test --test corpus -- --ignored --nocapture
+```
 
 ## Limitations
 

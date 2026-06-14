@@ -22,7 +22,7 @@ curl -fsSL "$BASE" \
       curl -fsSL "$BASE$href" -o "$SEEDS/$name"
     done
 
-# parse/macbinary take whole archives; deflate/lzss take size-prefixed bodies
+# parse/macbinary take whole archives; deflate takes size-prefixed bodies
 count=$(find "$SEEDS" -type f | wc -l | tr -d ' ')
 for t in parse macbinary; do
   mkdir -p "corpus/$t"

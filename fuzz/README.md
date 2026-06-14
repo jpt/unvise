@@ -6,12 +6,11 @@ Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](htt
 |------------------|---------------------------------------------------------------------|
 | `parse`          | `Archive::parse` - header / CVCT / FVCT, incl. compressed directory |
 | `deflate`        | `decrypt_and_decompress` - cipher + word-aligned DEFLATE            |
-| `lzss`           | `lzss::decompress` - v2 LZSS                                        |
 | `macbinary`      | `macbinary::strip` - wrapper detection                             |
 | `word_deflate`   | `deflate::word_deflate` - word-aligned DEFLATE, no cipher           |
 | `name_sanitizer` | `clean_name` then `safe_join` - path traversal guard               |
 
-`deflate`, `lzss`, and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
+`deflate` and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
 
 ## Setup
 
@@ -26,7 +25,6 @@ fuzz/fetch-corpus.sh          # seed corpus/parse + corpus/macbinary (needs curl
 ```sh
 cargo +nightly fuzz run parse     -- -dict=fuzz/vise.dict -max_len=65536
 cargo +nightly fuzz run deflate   -- -max_len=65536
-cargo +nightly fuzz run lzss      -- -max_len=65536
 cargo +nightly fuzz run macbinary -- -max_len=65536
 cargo +nightly fuzz run word_deflate   -- -max_len=65536
 cargo +nightly fuzz run name_sanitizer -- -max_len=4096
@@ -66,7 +64,6 @@ Measured 2026-06-13 by replaying each target corpus through a
 | `parse.rs`    | 90.8%  | 91.2% | The target's own surface                          |
 | `deflate.rs`  | 78.8%  | 80.6% | `parse` decompresses CVCT bodies                  |
 | `lib.rs`      |  1.9%  |  1.8% | `extract()` path, not called by `parse` by design |
-| `lzss.rs`     |  0.0%  |  0.0% | v2 path, covered by the `lzss` target             |
 | `macbinary.rs`|  0.0%  |  0.0% | wrapper path, covered by the `macbinary` target   |
 
 A file reading as cold under `parse` is expected: each target drives one entry
