@@ -43,14 +43,6 @@ impl Entry {
             Self::Dir(_) => None,
         }
     }
-
-    #[must_use]
-    pub fn as_dir(&self) -> Option<&str> {
-        match self {
-            Self::Dir(d) => Some(d),
-            Self::File(_) => None,
-        }
-    }
 }
 
 /// Metadata and location info for a single archived file
@@ -84,7 +76,6 @@ impl FileEntry {
 #[derive(Debug)]
 pub struct ArchiveInfo {
     pub entries: Vec<Entry>,
-    pub use_deflate: bool,
     pub num_segments: usize,
     pub fmt_major: u8,
     pub fmt_minor: u8,
@@ -103,7 +94,6 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
 
     let fmt_major = data[0x12];
     let fmt_minor = data[0x13];
-    let use_deflate = fmt_major == 0x03;
     let num_segments = read_u32(data, 0x14)? as usize;
 
     let cvct = read_u32(data, 0x24)? as usize;
@@ -189,7 +179,7 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         }
     }
 
-    Ok(ArchiveInfo { entries, use_deflate, num_segments, fmt_major, fmt_minor })
+    Ok(ArchiveInfo { entries, num_segments, fmt_major, fmt_minor })
 }
 
 /// Non-directory CVCT record tags, used only for stride inference

@@ -38,13 +38,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "lzss"
-path = "fuzz_targets/lzss.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "macbinary"
 path = "fuzz_targets/macbinary.rs"
 test = false
