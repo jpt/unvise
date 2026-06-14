@@ -4,13 +4,14 @@ Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](htt
 
 | Target           | Entry point                                                         |
 |------------------|---------------------------------------------------------------------|
+| `archive`        | `parse` then decompress all entries - shared blocks, fork slicing   |
 | `parse`          | `Archive::parse` - header / CVCT / FVCT, incl. compressed directory |
 | `deflate`        | `decrypt_and_decompress` - cipher + word-aligned DEFLATE            |
 | `macbinary`      | `macbinary::strip` - wrapper detection                             |
 | `word_deflate`   | `deflate::word_deflate` - word-aligned DEFLATE, no cipher           |
 | `name_sanitizer` | `clean_name` then `safe_join` - path traversal guard               |
 
-`deflate` and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
+`archive` is the primary target: it tests the interaction between parsed headers and the decompressor, including shared-block caching, offset groups, and fork slicing, without filesystem I/O. `deflate` and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
 
 ## Setup
 
@@ -22,6 +23,7 @@ cargo install cargo-fuzz
 ## Run
 
 ```sh
+cargo +nightly fuzz run archive   -- -dict=fuzz/vise.dict -max_len=65536
 cargo +nightly fuzz run parse     -- -dict=fuzz/vise.dict -max_len=65536
 cargo +nightly fuzz run deflate   -- -max_len=65536
 cargo +nightly fuzz run macbinary -- -max_len=65536
