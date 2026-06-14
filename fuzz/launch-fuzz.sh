@@ -32,7 +32,7 @@ N=$(nproc)
 parse_secs=7200
 other_secs=1800
 cmd="cargo +nightly fuzz run parse -- -dict=fuzz/vise.dict -max_len=65536 -fork=$N -ignore_crashes=1 -max_total_time=$parse_secs"
-for t in deflate lzss macbinary; do
+for t in deflate macbinary; do
   cmd="$cmd; cargo +nightly fuzz run $t -- -max_len=65536 -fork=$N -ignore_crashes=1 -max_total_time=$other_secs"
 done
 cmd="$cmd; echo ALL DONE"
@@ -41,6 +41,6 @@ tmux kill-session -t fuzz 2>/dev/null || true
 tmux new-session -d -s fuzz "$cmd"
 
 echo "launched all four targets in tmux session 'fuzz' on $N core(s)"
-echo "  parse ${parse_secs}s, then deflate/lzss/macbinary ${other_secs}s each"
+echo "  parse ${parse_secs}s, then deflate/macbinary ${other_secs}s each"
 echo "watch:   tmux attach -t fuzz        (detach with Ctrl-b d, do NOT Ctrl-C)"
 echo "crashes: fuzz/artifacts/<target>/"
