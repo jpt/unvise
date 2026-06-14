@@ -1,14 +1,14 @@
-//! DEFLATE decompression pipeline for VISE v3 archives
+//! DEFLATE decompression pipeline for VISE archives
 //!
-//! All v3 compressed data passes through three stages: byte-pair swap, a
-//! 256-byte substitution cipher, then DEFLATE decompression. The DEFLATE
-//! variant is word-aligned: the v3 variant reads bits from
-//! big-endian 16-bit words and aligns stored blocks to 16-bit boundaries
-//! (using `bits & 0xf` rather than standard zlib's `bits & 0x7`)
+//! All compressed data passes through three stages: byte-pair swap, a
+//! 256-byte substitution cipher, then DEFLATE decompression. This pipeline
+//! is shared across all observed VISE format versions (v2 and v3).
 //!
-//! For streams without stored blocks the output is bit-identical to standard
-//! DEFLATE, so flate2 is the fast path and the custom word-aligned decoder is
-//! the fallback, used only when flate2 can't handle a stream
+//! The v3 variant reads bits from big-endian 16-bit words
+//! and aligns stored blocks to 16-bit boundaries (using `bits & 0xf` rather
+//! than standard zlib's `bits & 0x7`). For streams without stored blocks the
+//! output is bit-identical to standard DEFLATE, so flate2 is the fast path
+//! and the custom word-aligned decoder is the fallback
 
 use std::sync::LazyLock;
 
@@ -32,7 +32,7 @@ const INFLATE_CHUNK: usize = 64 * 1024;
 /// `expected`, so a bogus header can't request a huge reservation up front
 const INITIAL_OUTPUT_CAP: usize = 1 << 20;
 
-/// Substitution cipher shared across all observed VISE v3 versions.
+/// Substitution cipher shared across all observed VISE versions.
 ///
 /// A bijective 256-byte permutation applied to the compressed data
 pub const CIPHER: [u8; 256] = [
@@ -57,8 +57,8 @@ pub const CIPHER: [u8; 256] = [
 /// Applies the VISE obfuscation layer in place.
 ///
 /// Adjacent byte pairs are swapped, then each byte is substituted through the
-/// cipher table. This transformation precedes DEFLATE decompression in all v3
-/// archives
+/// cipher table. This transformation precedes DEFLATE decompression in all
+/// VISE archives
 pub fn decrypt_in_place(buf: &mut [u8]) {
     let (pairs, tail) = buf.split_at_mut(buf.len() & !1);
     for pair in pairs.chunks_exact_mut(2) {
@@ -72,7 +72,7 @@ pub fn decrypt_in_place(buf: &mut [u8]) {
     }
 }
 
-/// Decrypts and decompresses a v3 compressed block
+/// Decrypts and decompresses a VISE compressed block
 ///
 /// Tries standard DEFLATE via flate2 first. Falls back to the word-aligned
 /// decoder when flate2 produces a length mismatch or decompression error.

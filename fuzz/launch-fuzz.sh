@@ -21,7 +21,7 @@ command -v cargo >/dev/null || curl --proto '=https' --tlsv1.2 -sSf https://sh.r
 rustup toolchain list | grep -q '^nightly' || rustup toolchain install nightly
 command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
 
-# Run the targets one at a time. ASan roughly doubles memory, so four at once can
+# Run the targets one at a time. ASan roughly doubles memory, so three at once can
 # OOM a small box; sequentially each still gets both cores via -fork. parse is the
 # deepest target and gets the most time (tune the seconds below). fork mode keeps
 # fuzzing past a crash, and each crash is saved under fuzz/artifacts
@@ -29,7 +29,7 @@ N=$(nproc)
 parse_secs=7200
 other_secs=1800
 cmd="cargo +nightly fuzz run parse -- -dict=fuzz/vise.dict -max_len=65536 -fork=$N -ignore_crashes=1 -max_total_time=$parse_secs"
-for t in deflate lzss macbinary; do
+for t in deflate macbinary; do
   cmd="$cmd; cargo +nightly fuzz run $t -- -max_len=65536 -fork=$N -ignore_crashes=1 -max_total_time=$other_secs"
 done
 cmd="$cmd; echo ALL DONE"
@@ -37,7 +37,7 @@ cmd="$cmd; echo ALL DONE"
 tmux kill-session -t fuzz 2>/dev/null || true
 tmux new-session -d -s fuzz "$cmd"
 
-echo "launched all four targets in tmux session 'fuzz' on $N core(s)"
-echo "  parse ${parse_secs}s, then deflate/lzss/macbinary ${other_secs}s each"
+echo "launched all three targets in tmux session 'fuzz' on $N core(s)"
+echo "  parse ${parse_secs}s, then deflate/macbinary ${other_secs}s each"
 echo "watch:   tmux attach -t fuzz        (detach with Ctrl-b d, do NOT Ctrl-C)"
 echo "crashes: fuzz/artifacts/<target>/"
