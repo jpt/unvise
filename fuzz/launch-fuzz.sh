@@ -24,7 +24,7 @@ command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --locked
 # seed corpus (best-effort; harmless if the source is unreachable)
 [ -x fuzz/fetch-corpus.sh ] && fuzz/fetch-corpus.sh || true
 
-# Run the targets one at a time. ASan roughly doubles memory, so four at once can
+# Run the targets one at a time. ASan roughly doubles memory, so three at once can
 # OOM a small box; sequentially each still gets both cores via -fork. parse is the
 # deepest target and gets the most time (tune the seconds below). fork mode keeps
 # fuzzing past a crash, and each crash is saved under fuzz/artifacts
@@ -40,7 +40,7 @@ cmd="$cmd; echo ALL DONE"
 tmux kill-session -t fuzz 2>/dev/null || true
 tmux new-session -d -s fuzz "$cmd"
 
-echo "launched all four targets in tmux session 'fuzz' on $N core(s)"
+echo "launched all three targets in tmux session 'fuzz' on $N core(s)"
 echo "  parse ${parse_secs}s, then deflate/macbinary ${other_secs}s each"
 echo "watch:   tmux attach -t fuzz        (detach with Ctrl-b d, do NOT Ctrl-C)"
 echo "crashes: fuzz/artifacts/<target>/"

@@ -43,7 +43,6 @@ impl Entry {
             Self::Dir(_) => None,
         }
     }
-
 }
 
 /// Metadata and location info for a single archived file
