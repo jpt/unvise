@@ -1,7 +1,7 @@
 //! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s Mac)
 //!
 //! Supports all observed VISE format versions from 00 01 through 03 0e:
-//! - v2 (00 01, 02 0x): LZSS with a 1024-byte circular window
+//! - v2 (00 01, 02 0x): byte-swap + substitution cipher + DEFLATE (same as v3)
 //! - v3 (03 00 - 03 05): byte-swap + substitution cipher + word-aligned DEFLATE
 //! - v3.06-07: new-style CVCT header with chunk-type table
 //! - v3.08-0e: CVCT body compressed with word-aligned DEFLATE
@@ -9,7 +9,6 @@
 #![warn(clippy::pedantic)]
 
 pub(crate) mod deflate;
-pub(crate) mod lzss;
 pub mod macbinary;
 mod parse;
 
@@ -28,7 +27,6 @@ pub use parse::{ArchiveInfo, Entry, FileEntry};
 pub mod fuzzing {
     pub use crate::deflate::decrypt_and_decompress;
     pub use crate::deflate::word_deflate;
-    pub use crate::lzss::decompress as lzss_decompress;
 
     use std::path::{Path, PathBuf};
 
@@ -232,12 +230,9 @@ impl Archive {
         if offset_groups.get(&offset).is_none_or(|v| v.len() <= 1) {
             return None;
         }
-        let end = block_off + len;
+        let end = block_off.checked_add(len)?;
         if end > block.len() {
-            return Some(Err(Error::Decompression(format!(
-                "shared block slice out of bounds: {block_off}..{end} in {} byte block",
-                block.len()
-            ))));
+            return None;
         }
         Some(Ok(&block[block_off..end]))
     }
@@ -281,12 +276,7 @@ impl Archive {
             )));
         }
         let src = &self.data[offset..offset + comp];
-
-        if self.info.use_deflate {
-            deflate::decrypt_and_decompress(src, uncomp)
-        } else {
-            lzss::decompress(src, uncomp)
-        }
+        deflate::decrypt_and_decompress(src, uncomp)
     }
 
     fn build_offset_groups(&self, files: &[&FileEntry]) -> OffsetGroups {
@@ -305,9 +295,6 @@ impl Archive {
         offset_groups: &OffsetGroups,
     ) -> HashMap<usize, Vec<u8>> {
         let mut blocks = HashMap::new();
-        if !self.info.use_deflate {
-            return blocks;
-        }
 
         // bound the resident size of the whole cache, not just each block: a
         // crafted archive could otherwise pin many large shared blocks in memory
@@ -327,7 +314,7 @@ impl Archive {
             if indices.len() <= 1 {
                 continue;
             }
-            let cd = files[indices[0]].comp_data;
+            let cd = indices.iter().map(|&i| files[i].comp_data).max().unwrap_or(0);
             if off + cd > self.data.len() {
                 continue;
             }

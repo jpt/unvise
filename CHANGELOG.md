@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.7
+
+### Changed
+- Improved v2 archive support (format 00 01, 02 0x)
+- Unified decompression pipeline across all format versions
+- Shared-block handling is more robust when block offsets are unavailable
+
+### Removed
+- LZSS module (unused; all observed archives use the DEFLATE pipeline)
+
+### Added
+- Integration test suite against public VISE corpus (21 archives across format versions)
+
 ## 0.1.6
 
 ### Added
