@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1
+
+### Added
+- Windows VISE support: extracts files from PE executables with `_mvdata` section or overlay (Installer VISE 3.5-3.7 era)
+- Companion `.qdat` volume support for Windows stub installers, with automatic discovery by session ID
+- PE parser (`pe` module) for locating VISE payloads in Windows executables
+- Auto-detection of Mac vs Windows format from file headers
+- Directory structure reconstruction from VISE install path variables
+
 ## 0.2.0
 
 ### Added

@@ -1,16 +1,24 @@
-//! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s Mac)
+//! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s)
 //!
-//! Supports all observed VISE format versions from 00 01 through 03 0e:
+//! Supports Mac VISE format versions from 00 01 through 03 0e and Windows
+//! VISE installers (PE executables with `_mvdata` section or overlay)
+//!
+//! Mac formats:
 //! - v2 (00 01, 02 0x): byte-swap + substitution cipher + DEFLATE (same as v3)
 //! - v3 (03 00 - 03 05): byte-swap + substitution cipher + word-aligned DEFLATE
 //! - v3.06-07: new-style CVCT header with chunk-type table
 //! - v3.08-0e: CVCT body compressed with word-aligned DEFLATE
+//!
+//! Windows formats:
+//! - PE with `_mvdata` section or overlay: byte-swap + DEFLATE
 
 #![warn(clippy::pedantic)]
 
 pub(crate) mod deflate;
 pub mod macbinary;
-mod parse;
+pub mod pe;
+mod mac;
+pub mod win;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -18,7 +26,32 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub use parse::{ArchiveInfo, Entry, FileEntry};
+pub use mac::{ArchiveInfo, Entry, FileEntry};
+pub use win::WinArchive;
+
+/// Detected input format for auto-dispatch
+pub enum InputKind {
+  Mac(Vec<u8>),
+  WinPe(Vec<u8>),
+  Unknown(Vec<u8>),
+}
+
+/// Detects whether `data` is a Mac VISE archive, a Windows VISE PE, or unknown.
+/// Mac data is returned after `MacBinary` stripping
+#[must_use]
+pub fn detect_format(data: Vec<u8>) -> InputKind {
+  if data.len() >= 2 && &data[..2] == b"MZ" {
+    return InputKind::WinPe(data);
+  }
+  if data.len() >= 4 && &data[..4] == b"SVCT" {
+    return InputKind::Mac(data);
+  }
+  let stripped = macbinary::strip(data);
+  if stripped.len() >= 4 && &stripped[..4] == b"SVCT" {
+    return InputKind::Mac(stripped);
+  }
+  InputKind::Unknown(stripped)
+}
 
 /// Decompression internals re-exported for the fuzz targets under the `fuzzing`
 /// feature only, not public API
@@ -112,7 +145,7 @@ impl Archive {
     /// Returns [`Error::InvalidArchive`] if the data is not a recognized VISE
     /// archive format
     pub fn parse(data: Vec<u8>) -> Result<Self, Error> {
-        let info = parse::parse(&data)?;
+        let info = mac::parse(&data)?;
         Ok(Self { data, info })
     }
 

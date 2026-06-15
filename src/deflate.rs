@@ -168,6 +168,20 @@ fn inflate_inner(
     expected == 0 || out.len() == expected
 }
 
+/// Byte-pair swap + standard DEFLATE without the substitution cipher.
+/// Used by Windows VISE archives which omit the cipher table
+pub(crate) fn swap_and_inflate(src: &[u8]) -> Option<Vec<u8>> {
+    if src.len() < 2 { return None; }
+    let mut swapped = src.to_vec();
+    for pair in swapped.chunks_exact_mut(2) {
+        pair.swap(0, 1);
+    }
+    match inflate(&swapped, 0) {
+        Some(out) => Some(out),
+        None => word_deflate(&swapped, 0).ok(),
+    }
+}
+
 /// Decompresses raw word-aligned DEFLATE without the byte-swap + substitution layer
 ///
 /// Used for v3.08+ CVCT bodies where the directory is compressed without the
@@ -178,11 +192,16 @@ fn inflate_inner(
 ///
 /// Returns [`Error::Decompression`] if the input is not valid word-aligned DEFLATE
 pub fn decompress_raw_word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+    swap_and_deflate_with_consumed(input, expected).map(|(data, _)| data)
+}
+
+/// Byte-swap + word-aligned DEFLATE, returning input bytes consumed
+pub fn swap_and_deflate_with_consumed(input: &[u8], expected: usize) -> Result<(Vec<u8>, usize), Error> {
     let mut swapped = input.to_vec();
     for pair in swapped.chunks_exact_mut(2) {
         pair.swap(0, 1);
     }
-    word_deflate(&swapped, expected)
+    word_deflate_with_consumed(&swapped, expected)
 }
 
 /// Largest output `comp_len` compressed bytes could legitimately produce. A
@@ -200,8 +219,11 @@ fn output_ceiling(comp_len: usize, expected: usize) -> usize {
 }
 
 pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
-    // Bound output growth so a crafted stream can't drive unbounded allocation
-    // (decompression bomb) or spin forever once the input is exhausted
+    word_deflate_with_consumed(input, expected).map(|(data, _)| data)
+}
+
+/// Like [`word_deflate`], but also returns the number of input bytes consumed
+pub fn word_deflate_with_consumed(input: &[u8], expected: usize) -> Result<(Vec<u8>, usize), Error> {
     let max_out = output_ceiling(input.len(), expected);
 
     let mut br = WordBitReader::new(input);
@@ -229,7 +251,7 @@ pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
                     #[allow(clippy::cast_possible_truncation)]
                     out.push(br.read_bits(8) as u8);
                 }
-                // Odd stored length leaves us mid-word; realign before next block
+                // Odd stored length leaves us mid-word; realign
                 br.align16();
             }
             1 => decode_huffman_block(&mut br, &mut out, true, max_out)?,
@@ -241,9 +263,8 @@ pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
             break;
         }
 
-        // Reject empty non-final blocks: real compressors never emit them, but a
-        // crafted stream can chain them to force endless Huffman-table builds
-        // (CPU burn) without ever growing output to trip the size cap
+        // A crafted stream can chain empty non-final blocks to burn CPU
+        // without ever growing output past the size cap
         if out.len() == progress_mark {
             return Err(Error::Decompression(
                 "non-final block produced no output".into(),
@@ -254,7 +275,7 @@ pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     if expected > 0 {
         out.truncate(expected);
     }
-    Ok(out)
+    Ok((out, br.pos))
 }
 
 struct WordBitReader<'a> {
