@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+- Criterion benchmark harness over the public VISE corpus (`cargo bench --features fuzzing`)
+
+### Changed
+- Public decoding functions renamed to `decode_in_place` and `decode_and_decompress`
+- DEFLATE backend switched from miniz_oxide to zlib-ng (SIMD-optimized), ~25% faster decompression across the corpus
+- Reuse `flate2::Decompress` and scratch buffer across entries via thread-locals, avoiding repeated zlib init and scratch allocation (~10-30% faster on small/many-entry archives)
+- Docs and comments revised for clarity
+
+### Fixed
+- `decompress_shared_blocks` bounds check uses `checked_add` (same fix as `decompress_raw` in 0.1.8)
+
 ## 0.1.8
 
 ### Added

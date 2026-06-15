@@ -1,14 +1,14 @@
 //! DEFLATE decompression pipeline for VISE archives
 //!
 //! All compressed data passes through three stages: byte-pair swap, a
-//! 256-byte substitution cipher, then DEFLATE decompression. This pipeline
+//! 256-byte substitution table, then DEFLATE decompression. This pipeline
 //! is shared across all observed VISE format versions (v2 and v3).
 //!
-//! The v3 variant reads bits from big-endian 16-bit words
-//! and aligns stored blocks to 16-bit boundaries (using `bits & 0xf` rather
-//! than standard zlib's `bits & 0x7`). For streams without stored blocks the
-//! output is bit-identical to standard DEFLATE, so flate2 is the fast path
-//! and the custom word-aligned decoder is the fallback
+//! The v3 variant reads bits from big-endian 16-bit words and aligns stored
+//! blocks to 16-bit boundaries (`bits & 0xf` rather than zlib's `bits & 0x7`).
+//! For streams without stored blocks the output is bit-identical to standard
+//! DEFLATE, so flate2 is the fast path and the custom word-aligned decoder is
+//! the fallback
 
 use std::sync::LazyLock;
 
@@ -32,7 +32,7 @@ const INFLATE_CHUNK: usize = 64 * 1024;
 /// `expected`, so a bogus header can't request a huge reservation up front
 const INITIAL_OUTPUT_CAP: usize = 1 << 20;
 
-/// Substitution cipher shared across all observed VISE versions.
+/// Substitution table shared across all observed VISE versions.
 ///
 /// A bijective 256-byte permutation applied to the compressed data
 pub const CIPHER: [u8; 256] = [
@@ -54,12 +54,12 @@ pub const CIPHER: [u8; 256] = [
     0x86, 0xdd, 0x5f, 0x42, 0xd3, 0x02, 0x61, 0x95, 0x0c, 0x5c, 0xa5, 0xcd, 0xc0, 0x07, 0xe2, 0xf3,
 ];
 
-/// Applies the VISE obfuscation layer in place
+/// Reverses the VISE encoding layer in place
 ///
 /// Adjacent byte pairs are swapped, then each byte is substituted through the
-/// cipher table. This transformation precedes DEFLATE decompression in all
+/// permutation table. This transformation precedes DEFLATE decompression in all
 /// VISE archives
-pub fn decrypt_in_place(buf: &mut [u8]) {
+pub fn decode_in_place(buf: &mut [u8]) {
     let (pairs, tail) = buf.split_at_mut(buf.len() & !1);
     for pair in pairs.chunks_exact_mut(2) {
         let a = pair[0];
@@ -82,15 +82,15 @@ pub fn decrypt_in_place(buf: &mut [u8]) {
 ///
 /// Returns [`Error::Decompression`] if both the flate2 fast path and the
 /// word-aligned fallback fail to produce `expected` bytes
-pub fn decrypt_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
-    let mut decrypted = src.to_vec();
-    decrypt_in_place(&mut decrypted);
+pub fn decode_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+    let mut decoded = src.to_vec();
+    decode_in_place(&mut decoded);
 
-    match inflate(&decrypted, expected) {
+    match inflate(&decoded, expected) {
         Some(out) => Ok(out),
         // word-aligned stored blocks defeat standard inflate; the custom decoder
         // handles those and applies the same output bound
-        None => word_deflate(&decrypted, expected),
+        None => word_deflate(&decoded, expected),
     }
 }
 
@@ -101,18 +101,41 @@ pub fn decrypt_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Er
 /// the output ran past what the input could legitimately produce, or it did not
 /// yield exactly `expected` bytes
 fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; INFLATE_CHUNK]);
+        static DEC: std::cell::RefCell<flate2::Decompress> = std::cell::RefCell::new(flate2::Decompress::new(false));
+    }
+
     let max_out = output_ceiling(input.len(), expected);
     let mut out = Vec::with_capacity(INITIAL_OUTPUT_CAP.min(max_out));
-    let mut scratch = vec![0u8; INFLATE_CHUNK];
-    let mut dec = flate2::Decompress::new(false);
 
+    let result = SCRATCH.with(|scratch_cell| {
+        DEC.with(|dec_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            let mut dec = dec_cell.borrow_mut();
+            dec.reset(false);
+            inflate_inner(input, expected, max_out, &mut out, &mut scratch, &mut dec)
+        })
+    });
+
+    if result { Some(out) } else { None }
+}
+
+fn inflate_inner(
+    input: &[u8],
+    expected: usize,
+    max_out: usize,
+    out: &mut Vec<u8>,
+    scratch: &mut [u8],
+    dec: &mut flate2::Decompress,
+) -> bool {
     loop {
         let in_before = dec.total_in();
         let out_before = dec.total_out();
         #[allow(clippy::cast_possible_truncation)]
         let status = dec.decompress(
             &input[in_before as usize..],
-            &mut scratch,
+            scratch,
             flate2::FlushDecompress::None,
         );
         // total_in/total_out are u64; VISE archives are well under 4 GB
@@ -122,7 +145,7 @@ fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
 
         // beyond what this input could legitimately expand to: a bomb, bail out
         if out.len() > max_out {
-            return None;
+            return false;
         }
 
         match status {
@@ -132,26 +155,22 @@ fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
                 let consumed = (dec.total_in() - in_before) as usize;
                 // no input taken and no output made: stalled (e.g. truncated stream)
                 if consumed == 0 && produced == 0 {
-                    return None;
+                    return false;
                 }
             }
-            Err(_) => return None,
+            Err(_) => return false,
         }
     }
 
     // accept only an exact match (or an unknown size); a short or long result
     // defers to the word-aligned decoder, preserving the prior fall-back behavior
-    if expected == 0 || out.len() == expected {
-        Some(out)
-    } else {
-        None
-    }
+    expected == 0 || out.len() == expected
 }
 
-/// Decompresses raw word-aligned DEFLATE without the byte-swap + cipher layer
+/// Decompresses raw word-aligned DEFLATE without the byte-swap + substitution layer
 ///
-/// Used for v3.08+ CVCT bodies where the directory is compressed but not
-/// encrypted. The raw bytes are byte-pair swapped to match `WordBitReader`'s
+/// Used for v3.08+ CVCT bodies where the directory is compressed without the
+/// encoding layer. The raw bytes are byte-pair swapped to match `WordBitReader`'s
 /// LE byte order, then passed through the standard word-aligned DEFLATE decoder.
 ///
 /// # Errors
@@ -595,7 +614,7 @@ mod tests {
     #[test]
     fn decrypt_swaps_and_ciphers() {
         let mut buf = vec![0x00, 0x01, 0x02, 0x03];
-        decrypt_in_place(&mut buf);
+        decode_in_place(&mut buf);
         assert_eq!(buf[0], CIPHER[0x01]);
         assert_eq!(buf[1], CIPHER[0x00]);
         assert_eq!(buf[2], CIPHER[0x03]);
@@ -605,7 +624,7 @@ mod tests {
     #[test]
     fn decrypt_odd_length() {
         let mut buf = vec![0x10, 0x20, 0x30];
-        decrypt_in_place(&mut buf);
+        decode_in_place(&mut buf);
         assert_eq!(buf[0], CIPHER[0x20]);
         assert_eq!(buf[1], CIPHER[0x10]);
         assert_eq!(buf[2], CIPHER[0x30]);
@@ -623,7 +642,7 @@ mod tests {
         for a in 0..=255u8 {
             for b in [0u8, 127, 255] {
                 let mut buf = [a, b];
-                decrypt_in_place(&mut buf);
+                decode_in_place(&mut buf);
                 assert_eq!(buf[0], CIPHER[b as usize]);
                 assert_eq!(buf[1], CIPHER[a as usize]);
             }
