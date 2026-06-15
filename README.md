@@ -77,15 +77,11 @@ VISE archives are structured around four chunk types:
 
 ### Compression
 
-All observed VISE versions use the same obfuscation layer: adjacent byte pairs are swapped, then each byte passes through a 256-byte substitution cipher. The decrypted result is standard DEFLATE.
-
-The v3 variant reads bits from big-endian 16-bit words and aligns stored blocks to word boundaries (`bits & 0xf` instead of zlib's `bits & 0x7`). For streams without stored blocks the output is bit-identical to standard DEFLATE, so the fast path uses flate2/zlib and only falls back to the custom word-aligned decoder when needed.
+File data is stored as DEFLATE with a byte-pair swap and substitution table applied to the compressed stream. The fast path uses flate2; a custom word-aligned decoder handles the v3 variant where stored blocks align to 16-bit boundaries
 
 ### Shared compressed blocks
 
-Multiple FVCT entries can share the same `data_offset`, meaning their forks are packed into a single compressed block. Each entry's `block_data_off` / `block_rsrc_off` fields give the byte offset within the decompressed block where that entry's fork starts. The actual compressed size is the maximum `comp_data` across all entries sharing the offset.
-
-In v2 archives, `block_data_off` contains garbage values; shared-block slicing is skipped and each entry is decompressed individually.
+Multiple FVCT entries can share the same `data_offset`. Each entry's `block_data_off` / `block_rsrc_off` gives its byte offset within the decompressed block. v2 archives predate shared blocks, so each entry is decompressed individually
 
 ### Multi-segment installers
 

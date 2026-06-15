@@ -25,7 +25,7 @@ pub use parse::{ArchiveInfo, Entry, FileEntry};
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing {
-    pub use crate::deflate::decrypt_and_decompress;
+    pub use crate::deflate::decode_and_decompress;
     pub use crate::deflate::word_deflate;
 
     use std::path::{Path, PathBuf};
@@ -307,7 +307,7 @@ impl Archive {
             ))
         })?;
         let src = &self.data[offset..end];
-        deflate::decrypt_and_decompress(src, uncomp)
+        deflate::decode_and_decompress(src, uncomp)
     }
 
     fn build_offset_groups(&self, files: &[&FileEntry]) -> OffsetGroups {
@@ -346,10 +346,10 @@ impl Archive {
                 continue;
             }
             let cd = indices.iter().map(|&i| files[i].comp_data).max().unwrap_or(0);
-            if off + cd > self.data.len() {
+            let Some(end) = off.checked_add(cd).filter(|&e| e <= self.data.len()) else {
                 continue;
-            }
-            if let Ok(data) = deflate::decrypt_and_decompress(&self.data[off..off + cd], 0) {
+            };
+            if let Ok(data) = deflate::decode_and_decompress(&self.data[off..end], 0) {
                 if resident.saturating_add(data.len()) > budget {
                     eprintln!("  shared-block cache hit {budget} byte budget; remaining blocks decode on demand");
                     break;
