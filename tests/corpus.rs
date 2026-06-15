@@ -1,35 +1,9 @@
+mod corpus_data;
+
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
-
-const SEMBIANCE_BASE: &str =
-    "https://sembiance.com/fileFormatSamples/archive/installerVISE/";
-
-const SEMBIANCE_FILES: &[&str] = &[
-    "CleanResource 2.2",
-    "Days To Go 2.1.3 Installer",
-    "Index-TV PPC Installer ja",
-    "Install Flash Player 7 OSX",
-    "Install MyEyes 2.3.3",
-    "Install ScreenSaver",
-    "Install Secret Paths",
-    "Installer",
-    "Installeur Desktop Terminator",
-    "Internet Config Module",
-    "LP TableMaker Install",
-    "NSA_ES",
-    "NUpowr G3 v1.0.1 Installer",
-    "PK-G3A Installer",
-    "PocketTranser\u{2044}je eco",
-    "RealSpace Plugin Installer",
-    "Sketch!Net Installer",
-    "Type Recorder 1.5.1",
-    "WebJPEG 1.2 Install",
-    "euro98",
-    "\u{30A4}\u{30F3}\u{30B9}\u{30C8}\u{30FC}\u{30E9}",
-];
 
 fn expected_content_hashes() -> HashMap<&'static str, &'static str> {
     HashMap::from([
@@ -55,28 +29,6 @@ fn expected_content_hashes() -> HashMap<&'static str, &'static str> {
         ("euro98", "1ca787f3b4182e22066382551e66c4f6c01be570b743a9b69f738d76759a9e0c"),
         ("\u{30A4}\u{30F3}\u{30B9}\u{30C8}\u{30FC}\u{30E9}", "6dae18660400255062c7d307d7631350fc1b88a8957312c303fe91c7172e8b1d"),
     ])
-}
-
-fn cache_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("corpus");
-    std::fs::create_dir_all(&dir).expect("create corpus cache dir");
-    dir
-}
-
-fn download(name: &str, dest: &Path) {
-    if dest.exists() {
-        return;
-    }
-    let url = format!("{}{}", SEMBIANCE_BASE, urlencoding::encode(name));
-    let status = Command::new("curl")
-        .args(["-fsSL", "-o"])
-        .arg(dest)
-        .arg(&url)
-        .status()
-        .expect("curl not found");
-    assert!(status.success(), "failed to download {name}");
 }
 
 fn content_hash(dir: &Path) -> String {
@@ -119,13 +71,11 @@ fn content_hash(dir: &Path) -> String {
 #[test]
 #[ignore]
 fn sembiance_corpus_content_verified() {
-    let cache = cache_dir();
     let expected = expected_content_hashes();
     let mut mismatches = Vec::new();
 
-    for &name in SEMBIANCE_FILES {
-        let dest = cache.join(name);
-        download(name, &dest);
+    for &name in corpus_data::SEMBIANCE_FILES {
+        let dest = corpus_data::download(name);
 
         let raw = std::fs::read(&dest).expect("read downloaded file");
         let data = unvise::macbinary::strip(raw);
