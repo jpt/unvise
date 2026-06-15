@@ -1,19 +1,6 @@
 # unvise
 
-Extracts files from Mac-based Installer VISE archives, the installer format created by MindVision Software in the 1990s and used widely through the classic Mac OS era
-
-## Supported versions
-
-| Format bytes | Notes |
-|---|---|
-| 00 01, 02 0x | Standard DEFLATE; no shared-block slicing |
-| 03 00 - 03 05 | Word-aligned DEFLATE; shared-block slicing |
-| 03 06 - 03 07 | New CVCT header with chunk-type table |
-| 03 08 - 03 0e | CVCT body is compressed |
-
-All versions use the same byte-swap + substitution cipher + DEFLATE pipeline. The v3 DEFLATE variant aligns stored blocks to 16-bit word boundaries
-
-The format version is at bytes 0x12-0x13 of the SVCT header. These are archive format versions, not product versions. The highest format version tested was 03 0e, from Installer VISE 8.5 (July 2005)
+Extracts files from Mac and Windows **Installer VISE** archives, the installer format created by MindVision Software in the 1990s
 
 ## Install
 
@@ -35,9 +22,7 @@ cargo build --release
 unvise <installer_file> [output_dir]
 ```
 
-The output directory defaults to `unvise_out/`. Each archived file produces up to two outputs: the data fork (`filename`) and the resource fork (`filename.rsrc`)
-
-MacBinary wrappers are detected and stripped automatically. You can pass either a raw data fork or a MacBinary-wrapped file
+The output directory defaults to `unvise_out/`. Mac archives produce up to two outputs per file: the data fork and the resource fork (`.rsrc`). Windows archives recreate the original directory structure. MacBinary wrappers are detected and stripped automatically
 
 ### Extracting from HFS disk images
 
@@ -66,30 +51,67 @@ Extracting to output/
 Done: 87 extracted, 0 skipped, 0 failed
 ```
 
-## Archive format
+## Source layout
 
-VISE archives are structured around four chunk types:
+```
+src/
+├── lib.rs          # public API, format detection, shared helpers
+├── mac.rs          # Mac archive parser (SVCT/CVCT/FVCT chunks)
+├── win.rs          # Windows archive parser (record stream, qdat)
+├── deflate.rs      # decompression pipeline (byte-swap, cipher, DEFLATE)
+├── pe.rs           # PE payload extraction (_mvdata section or overlay)
+├── macbinary.rs    # MacBinary wrapper detection and stripping
+└── main.rs         # CLI
+```
 
-- **SVCT:** archive header at offset 0. Contains format version at bytes 0x12-0x13 and a pointer to the CVCT at 0x24
+## Formats
+
+The format is detected from file headers
+
+### Mac
+
+Detected from SVCT header or MacBinary wrapper
+
+| Format bytes | Notes |
+|---|---|
+| 00 01 - 02 0x | Standard DEFLATE; no shared-block slicing |
+| 03 00 - 03 05 | Word-aligned DEFLATE; shared-block slicing |
+| 03 06 - 03 07 | New CVCT header with chunk-type table |
+| 03 08 - 03 0e | CVCT body is compressed |
+
+The format version is at bytes 0x12-0x13 of the SVCT header. These are archive format versions, not product versions. The highest tested was 03 0e, from Installer VISE 8.5 (July 2005)
+
+Archives are structured around four chunk types:
+
+- **SVCT:** archive header at offset 0. Contains format version and a pointer to the CVCT at 0x24
 - **CVCT:** file table container. Holds a sequence of DVCT and FVCT records. v3.06+ adds a 100-byte header with chunk-type offsets (PACK, BBrd, CODE, etc.) before the record body. v3.08+ compresses the record body with word-aligned DEFLATE
 - **DVCT:** directory entry. Names the folder that subsequent files belong to
 - **FVCT:** file entry. Contains Mac type/creator codes, compressed and uncompressed sizes for both data and resource forks, and the offset to the compressed data within the archive
 
-### Compression
-
-File data is stored as DEFLATE with a byte-pair swap and substitution table applied to the compressed stream. The fast path uses flate2; a custom word-aligned decoder handles the v3 variant where stored blocks align to 16-bit boundaries
-
-### Shared compressed blocks
+All versions use the same byte-swap + substitution cipher + DEFLATE pipeline. The v3 variant aligns stored blocks to 16-bit word boundaries. The fast path uses flate2; a custom word-aligned decoder handles the v3 variant
 
 Multiple FVCT entries can share the same `data_offset`. Each entry's `block_data_off` / `block_rsrc_off` gives its byte offset within the decompressed block. v2 archives predate shared blocks, so each entry is decompressed individually
 
+Entries with bit 27 set in the flags field (offset FVCT+12) are not files; they encode installer conditions (platform checks, optional component toggles). These are reported in output but not extracted
+
+### Windows
+
+Detected from MZ/PE header. Supports PE executables with `_mvdata` section (Apple builds) or PE overlay (all other builds). Four runtime versions are handled, detected from the embedded vise32ex.dll:
+
+| Runtime | Notes |
+|---|---|
+| Pre-4.x (1998) | u8 string prefixes; blob offsets are file-relative |
+| Apple 2.x | `_mvdata` section; install path in record stream; stub+qdat support |
+| Mainline 4.1-4.7 | PE overlay; install path resolved internally |
+| Mainline 4.8+ | Wider common header layout; otherwise same as 4.1-4.7 |
+
+The payload contains a typed record stream preceded by embedded support DLLs and installer metadata. Each record has a u32 type tag and a common header followed by type-specific fields; type 2 records are file install entries carrying the filename, install path, sizes, and a blob offset
+
+File data is stored as DEFLATE with a byte-pair swap applied to the compressed stream (no substitution cipher, unlike Mac). Each file is compressed independently; the record stream provides the offset and size for each one. Blob offsets are payload-relative in most formats but file-relative in the oldest (pre-4.x) runtime. Files are extracted with their original directory structure reconstructed from install path variables
+
 ### Multi-segment installers
 
-Some format 3 installers span multiple disks. The SVCT header at offset 0x14 records the total segment count, and each FVCT entry has a segment number at offset +98. Files on segment 0 are stored on the distribution media (e.g. a CD), not in the installer archive itself. Files from segments not present in the provided file are reported as skipped
-
-### Condition records
-
-Entries with bit 27 set in the flags field (offset FVCT+12) are not files; they encode installer conditions (platform checks, optional component toggles). These are reported in output but not extracted
+Some installers span multiple files. On Mac, each FVCT entry carries a segment number; multi-segment Mac archives are not yet supported (files on missing segments are reported and skipped). On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
 
 ## Testing
 
@@ -99,11 +121,9 @@ Unit tests cover the decompression pipeline, parser, and safety checks:
 cargo test
 ```
 
-## Limitations
+## Acknowledgements
 
-- **VISE for Windows** is not supported (untested)
-- **Multi-segment installers** require all segments in one file. Files on missing segments are reported and skipped
-- **Resource fork semantics** are not preserved beyond raw byte extraction. No AppleDouble or MacBinary output is generated
+This software package is dedicated to the memory of Tyler Kellen
 
 ## License
 
