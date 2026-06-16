@@ -28,7 +28,7 @@ fn main() {
   let out_dir = args.get(2).map_or("unvise_out", String::as_str);
 
   match unvise::detect_format(raw) {
-    InputKind::Mac(data) => extract_mac(data, out_dir),
+    InputKind::Mac(data) => extract_mac(data, &args[1], out_dir),
     InputKind::WinPe(data) => extract_win(&data, &args[1], out_dir),
     InputKind::Unknown(_) => {
       eprintln!("error: not a recognized VISE archive");
@@ -37,8 +37,14 @@ fn main() {
   }
 }
 
-fn extract_mac(data: Vec<u8>, out_dir: &str) {
-  let archive = match Archive::parse(data) {
+fn extract_mac(data: Vec<u8>, exe_path: &str, out_dir: &str) {
+  let segments = find_segments(&data, exe_path);
+  let archive = if segments.is_empty() {
+    Archive::parse(data)
+  } else {
+    Archive::parse_with_segments(data, segments)
+  };
+  let archive = match archive {
     Ok(a) => a,
     Err(e) => {
       eprintln!("error: {e}");
@@ -49,19 +55,6 @@ fn extract_mac(data: Vec<u8>, out_dir: &str) {
   let info = &archive.info;
   eprintln!("VISE format: {:02x} {:02x}", info.fmt_major, info.fmt_minor);
   eprintln!("CVCT: {} entries, {} segments", count_files(&archive), info.num_segments);
-
-  if info.num_segments > 1 {
-    let mut missing: Vec<u16> = archive.info.entries.iter()
-      .filter_map(|e| e.as_file().map(|f| f.segment))
-      .filter(|&s| s != 1 && s != 0)
-      .collect::<std::collections::HashSet<_>>()
-      .into_iter()
-      .collect();
-    missing.sort_unstable();
-    if !missing.is_empty() {
-      eprintln!("  segments {missing:?} not present in this file");
-    }
-  }
 
   let stubs = count_stubs(&archive);
   let extractable = count_files(&archive) - stubs;
@@ -164,6 +157,65 @@ fn find_qdat(payload: &[u8], exe_path: &str) -> Option<Vec<u8>> {
   None
 }
 
+
+/// Scans the same directory as the archive for VISE segment files.
+/// A segment file starts with SVCT and carries a segment number > 1
+/// at offset 0x04. Reads through MacBinary wrappers
+fn find_segments(main_data: &[u8], archive_path: &str) -> Vec<Vec<u8>> {
+  let num_segments = if main_data.len() >= 0x18 && &main_data[..4] == b"SVCT" {
+    u32::from_be_bytes(main_data[0x14..0x18].try_into().unwrap_or([0; 4])) as usize
+  } else {
+    0
+  };
+  if num_segments <= 1 {
+    return Vec::new();
+  }
+
+  let dir = match Path::new(archive_path).parent() {
+    Some(d) => d,
+    None => return Vec::new(),
+  };
+
+  let mut segments = Vec::new();
+  for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    let path = entry.path();
+    if !path.is_file() { continue; }
+    if path == Path::new(archive_path) { continue; }
+
+    // Probe the first 132 bytes before reading the full file
+    let mut probe = [0u8; 132];
+    let Ok(mut f) = std::fs::File::open(&path) else { continue };
+    let Ok(n) = std::io::Read::read(&mut f, &mut probe) else { continue };
+    drop(f);
+
+    let is_svct = (n >= 0x2c && &probe[..4] == b"SVCT")
+      || (n >= 128 + 4 && &probe[128..132] == b"SVCT");
+    if !is_svct { continue; }
+
+    let Ok(data) = std::fs::read(&path) else { continue };
+    let seg_data = if data.len() > 0x2c && &data[..4] == b"SVCT" {
+      data
+    } else if data.len() > 128 + 0x2c && &data[128..132] == b"SVCT" {
+      unvise::macbinary::strip(data)
+    } else {
+      continue;
+    };
+
+    let seq = u32::from_be_bytes(seg_data[4..8].try_into().unwrap_or([0; 4]));
+    if seq > 1 {
+      eprintln!("Segment {seq}: {}", path.display());
+      segments.push(seg_data);
+    }
+  }
+
+  if !segments.is_empty() {
+    eprintln!("{} segment file(s) found", segments.len());
+  } else if num_segments > 1 {
+    eprintln!("warning: archive declares {num_segments} segments but no segment files found in {}", dir.display());
+  }
+
+  segments
+}
 
 fn count_files(archive: &Archive) -> usize {
   archive.info.entries.iter()

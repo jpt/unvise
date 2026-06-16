@@ -111,7 +111,7 @@ File data is stored as DEFLATE with a byte-pair swap applied to the compressed s
 
 ### Multi-segment installers
 
-Some installers span multiple files. On Mac, each FVCT entry carries a segment number; multi-segment Mac archives are not yet supported (files on missing segments are reported and skipped). On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
+Some installers span multiple files. On Mac, segment files are discovered automatically in the same directory as the main archive and concatenated by sequence number. On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
 
 ## Testing
 
