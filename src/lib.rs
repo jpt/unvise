@@ -1,16 +1,24 @@
-//! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s Mac)
+//! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s)
 //!
-//! Supports all observed VISE format versions from 00 01 through 03 0e:
+//! Supports Mac VISE format versions from 00 01 through 03 0e and Windows
+//! VISE installers (PE executables with `_mvdata` section or overlay)
+//!
+//! Mac formats:
 //! - v2 (00 01, 02 0x): byte-swap + substitution cipher + DEFLATE (same as v3)
 //! - v3 (03 00 - 03 05): byte-swap + substitution cipher + word-aligned DEFLATE
 //! - v3.06-07: new-style CVCT header with chunk-type table
 //! - v3.08-0e: CVCT body compressed with word-aligned DEFLATE
+//!
+//! Windows formats:
+//! - PE with `_mvdata` section or overlay: byte-swap + DEFLATE
 
 #![warn(clippy::pedantic)]
 
 pub(crate) mod deflate;
 pub mod macbinary;
-mod parse;
+pub mod pe;
+mod mac;
+pub mod win;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -18,7 +26,32 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub use parse::{ArchiveInfo, Entry, FileEntry};
+pub use mac::{ArchiveInfo, Entry, FileEntry};
+pub use win::WinArchive;
+
+/// Detected input format for auto-dispatch
+pub enum InputKind {
+  Mac(Vec<u8>),
+  WinPe(Vec<u8>),
+  Unknown(Vec<u8>),
+}
+
+/// Detects whether `data` is a Mac VISE archive, a Windows VISE PE, or unknown.
+/// Mac data is returned after `MacBinary` stripping
+#[must_use]
+pub fn detect_format(data: Vec<u8>) -> InputKind {
+  if data.len() >= 2 && &data[..2] == b"MZ" {
+    return InputKind::WinPe(data);
+  }
+  if data.len() >= 4 && &data[..4] == b"SVCT" {
+    return InputKind::Mac(data);
+  }
+  let stripped = macbinary::strip(data);
+  if stripped.len() >= 4 && &stripped[..4] == b"SVCT" {
+    return InputKind::Mac(stripped);
+  }
+  InputKind::Unknown(stripped)
+}
 
 /// Decompression internals re-exported for the fuzz targets under the `fuzzing`
 /// feature only, not public API
@@ -87,11 +120,15 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+/// Byte offset where segment data begins in each SVCT file
+const SEGMENT_DATA_START: usize = 0x2c;
+
 /// A loaded VISE archive ready for extraction
 #[derive(Debug)]
 pub struct Archive {
     data: Vec<u8>,
     pub info: ArchiveInfo,
+    segments_loaded: bool,
 }
 
 /// Outcome of an extraction run
@@ -112,8 +149,44 @@ impl Archive {
     /// Returns [`Error::InvalidArchive`] if the data is not a recognized VISE
     /// archive format
     pub fn parse(data: Vec<u8>) -> Result<Self, Error> {
-        let info = parse::parse(&data)?;
-        Ok(Self { data, info })
+        let info = mac::parse(&data)?;
+        Ok(Self { data, info, segments_loaded: false })
+    }
+
+    /// Parses a multi-segment archive. `segments` are the companion segment
+    /// files (Segment.2, Segment.3, etc.) in any order; each carries its
+    /// sequence number at SVCT+0x04. Data from all segments is concatenated
+    /// in order after the main archive's data region so that FVCT offsets
+    /// resolve correctly
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArchive`] if any segment lacks an SVCT header
+    pub fn parse_with_segments(data: Vec<u8>, segments: Vec<Vec<u8>>) -> Result<Self, Error> {
+        let info = mac::parse(&data)?;
+        if segments.is_empty() {
+            return Ok(Self { data, info, segments_loaded: false });
+        }
+
+        let mut numbered: Vec<(u32, &[u8])> = Vec::new();
+        for seg in &segments {
+            if seg.len() < SEGMENT_DATA_START + 4 || &seg[..4] != b"SVCT" {
+                return Err(Error::InvalidArchive("segment file missing SVCT header".into()));
+            }
+            let seq = u32::from_be_bytes(seg[4..8].try_into().unwrap());
+            numbered.push((seq, seg));
+        }
+        numbered.sort_by_key(|&(seq, _)| seq);
+
+        let cvct_off = u32::from_be_bytes(data[0x24..0x28].try_into().unwrap()) as usize;
+        let main_data_end = cvct_off.min(data.len());
+
+        let mut combined = data[..main_data_end].to_vec();
+        for &(_, seg) in &numbered {
+            combined.extend_from_slice(&seg[SEGMENT_DATA_START..]);
+        }
+
+        Ok(Self { data: combined, info, segments_loaded: true })
     }
 
     /// Extracts all available files to `out_dir`, creating directories as needed.
@@ -207,12 +280,19 @@ impl Archive {
             let name = if f.name.is_empty() { "(unnamed)" } else { &f.name };
             return Some(format!("[condition] {name} (flags=0x{:08x})", f.flags));
         }
-        if self.info.num_segments > 1 && f.segment != 1 {
-            return Some(format!("[segment {}] {}", f.segment, clean_name(&f.name)));
+        if self.info.num_segments > 1 {
+            // Segment 0 entries live on the distribution disc, not in the archive
+            if f.segment == 0 {
+                return Some(format!("[disc] {}", clean_name(&f.name)));
+            }
+            // Without loaded segments, only segment 1 data is available
+            if !self.segments_loaded && f.segment != 1 {
+                return Some(format!("[segment {}] {}", f.segment, clean_name(&f.name)));
+            }
         }
         let total = f.data_offset + f.comp_data + f.comp_rsrc;
         if total > self.data.len() && !shared_blocks.contains_key(&f.data_offset) {
-            return Some(format!("[cross-segment] {} (data extends beyond segment 1)", clean_name(&f.name)));
+            return Some(format!("[missing segment] {}", clean_name(&f.name)));
         }
         None
     }
@@ -313,7 +393,8 @@ impl Archive {
     fn build_offset_groups(&self, files: &[&FileEntry]) -> OffsetGroups {
         let mut groups: OffsetGroups = HashMap::new();
         for (i, f) in files.iter().enumerate() {
-            if f.comp_data > 0 && !f.is_stub() && (self.info.num_segments <= 1 || f.segment == 1) {
+            if f.comp_data > 0 && !f.is_stub()
+              && (self.info.num_segments <= 1 || (f.segment != 0 && (self.segments_loaded || f.segment == 1))) {
                 groups.entry(f.data_offset).or_default().push(i);
             }
         }
@@ -410,9 +491,25 @@ mod tests {
     fn safe_join_rejects_escapes() {
         let base = Path::new("/out");
         assert_eq!(safe_join(base, "sub/file.txt"), Some(PathBuf::from("/out/sub/file.txt")));
-        // Defense in depth: even if a malformed name reaches here, it cannot escape
         assert_eq!(safe_join(base, "../escape"), None);
         assert_eq!(safe_join(base, "a/../b"), None);
         assert_eq!(safe_join(base, "/abs/path"), None);
+    }
+
+    #[test]
+    fn segment_file_requires_svct() {
+        let main = vec![0u8; 64];
+        let bad_seg = vec![0u8; 64];
+        assert!(Archive::parse_with_segments(main, vec![bad_seg]).is_err());
+    }
+
+    #[test]
+    fn segment_sequence_from_svct() {
+        // SVCT+0x04 carries the segment sequence number
+        let mut seg = vec![0u8; 0x30];
+        seg[..4].copy_from_slice(b"SVCT");
+        seg[4..8].copy_from_slice(&3u32.to_be_bytes());
+        let seq = u32::from_be_bytes(seg[4..8].try_into().unwrap());
+        assert_eq!(seq, 3);
     }
 }

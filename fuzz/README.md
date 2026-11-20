@@ -10,8 +10,10 @@ Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](htt
 | `macbinary`      | `macbinary::strip` - wrapper detection                             |
 | `word_deflate`   | `deflate::word_deflate` - word-aligned DEFLATE, no cipher           |
 | `name_sanitizer` | `clean_name` then `safe_join` - path traversal guard               |
+| `winvise`        | `WinArchive::parse` + `extract` - Windows VISE record stream       |
+| `pe`             | `pe::extract_payload` - PE section table parsing                    |
 
-`archive` is the primary target: it tests the interaction between parsed headers and the decompressor, including shared-block caching, offset groups, and fork slicing, without filesystem I/O. `deflate` and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
+`archive` is the primary Mac target: it tests the interaction between parsed headers and the decompressor, including shared-block caching, offset groups, and fork slicing, without filesystem I/O. `winvise` is the primary Windows target: it exercises the typed record stream parser and DEFLATE decompression. `deflate` and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
 
 ## Setup
 
@@ -19,6 +21,8 @@ Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](htt
 rustup toolchain install nightly
 cargo install cargo-fuzz
 ```
+
+No seed corpus is included. To seed a target, copy archives you have the right to use into `fuzz/corpus/<target>/` (`parse` and `macbinary` take whole archives)
 
 ## Run
 
