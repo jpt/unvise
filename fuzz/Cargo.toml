@@ -78,3 +78,10 @@ path = "fuzz_targets/pe.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "multiseg"
+path = "fuzz_targets/multiseg.rs"
+test = false
+doc = false
+bench = false
