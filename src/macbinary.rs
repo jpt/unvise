@@ -19,15 +19,14 @@ pub fn strip(data: Vec<u8>) -> Vec<u8> {
     // can't mis-strip a non-VISE file
     let name_len = data[1];
     let data_len = u32::from_be_bytes([data[83], data[84], data[85], data[86]]) as usize;
+    let fork = data[128..].get(..data_len);
     let wrapped = data[0] == 0
         && (1..=63).contains(&name_len)
         && data_len != 0
-        && 128 + data_len <= data.len()
-        && data.get(128..132) == Some(b"SVCT".as_slice());
+        && fork.is_some_and(|fork| fork.starts_with(b"SVCT"));
 
-    if wrapped {
-        data[128..128 + data_len].to_vec()
-    } else {
-        data
+    match fork {
+        Some(fork) if wrapped => fork.to_vec(),
+        _ => data,
     }
 }

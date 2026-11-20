@@ -1,110 +1,87 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use unvise::{Archive, Entry, InputKind};
+use unvise::{Archive, InputKind, Progress, SkipReason, WinArchive};
+
+const USAGE: &str = "\
+usage: unvise <vise_installer> [output_dir]
+
+Extracts files from Installer VISE archives (Mac and Windows).
+Accepts raw data forks, MacBinary-wrapped files, or Windows PE executables.
+The output directory defaults to unvise_out/
+
+options:
+  -h, --help       show this help
+  -V, --version    show the version";
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|a| a == "--version" || a == "-V") {
+    let mut args = std::env::args_os().skip(1);
+    let Some(first) = args.next() else {
+        eprintln!("{USAGE}");
+        process::exit(1);
+    };
+    if first == "--version" || first == "-V" {
         println!("unvise {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    if args.len() < 2 {
-        eprintln!("usage: {} <vise_installer> [output_dir]", args[0]);
-        eprintln!();
-        eprintln!("Extracts files from Installer VISE archives (Mac and Windows).");
-        eprintln!("Accepts raw data forks, MacBinary-wrapped files, or Windows PE executables.");
-        process::exit(1);
+    if first == "--help" || first == "-h" {
+        println!("{USAGE}");
+        return;
     }
 
-    let raw = match std::fs::read(&args[1]) {
+    let input = PathBuf::from(first);
+    let out_dir = args
+        .next()
+        .map_or_else(|| PathBuf::from("unvise_out"), PathBuf::from);
+
+    let raw = match std::fs::read(&input) {
         Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {}: {e}", args[1]);
-            process::exit(1);
-        }
+        Err(e) => fail(&format!("{}: {e}", input.display())),
     };
 
-    let out_dir = args.get(2).map_or("unvise_out", String::as_str);
-
     match unvise::detect_format(raw) {
-        InputKind::Mac(data) => extract_mac(data, &args[1], out_dir),
-        InputKind::WinPe(data) => extract_win(&data, &args[1], out_dir),
-        InputKind::Unknown(_) => {
-            eprintln!("error: not a recognized VISE archive");
-            process::exit(1);
-        }
+        InputKind::Mac(data) => extract_mac(data, &input, &out_dir),
+        InputKind::WinPe(data) => extract_win(data, &input, &out_dir),
+        _ => fail("not a recognized VISE archive"),
     }
 }
 
-fn extract_mac(data: Vec<u8>, exe_path: &str, out_dir: &str) {
-    let segments = find_segments(&data, exe_path);
+fn fail(message: &str) -> ! {
+    eprintln!("error: {message}");
+    process::exit(1);
+}
+
+fn extract_mac(data: Vec<u8>, input: &Path, out_dir: &Path) {
+    let segments = find_segments(&data, input);
     let archive = if segments.is_empty() {
         Archive::parse(data)
     } else {
-        Archive::parse_with_segments(data, segments)
+        Archive::parse_with_segments(data, &segments)
     };
-    let archive = match archive {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
+    let archive = archive.unwrap_or_else(|e| fail(&e.to_string()));
 
     let info = &archive.info;
+    let files = archive.files().count();
+    let stubs = archive.files().filter(|f| f.is_stub()).count();
     eprintln!("VISE format: {:02x} {:02x}", info.fmt_major, info.fmt_minor);
-    eprintln!(
-        "CVCT: {} entries, {} segments",
-        count_files(&archive),
-        info.num_segments
-    );
-
-    let stubs = count_stubs(&archive);
-    let extractable = count_files(&archive) - stubs;
-    eprintln!("{extractable} extractable, {stubs} condition records");
+    eprintln!("CVCT: {files} entries, {} segments", info.num_segments);
+    eprintln!("{} extractable, {stubs} condition records", files - stubs);
     eprintln!();
-    eprintln!("Extracting to {out_dir}/");
+    eprintln!("Extracting to {}/", out_dir.display());
     eprintln!();
 
-    let result = match archive.extract(Path::new(out_dir)) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
-
-    eprintln!();
-    eprintln!(
-        "Done: {} extracted, {} skipped, {} failed",
-        result.extracted, result.skipped, result.failed
-    );
-
-    if result.failed > 0 {
-        process::exit(1);
-    }
+    let result = archive
+        .extract_with(out_dir, report)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    finish(result);
 }
 
-fn extract_win(data: &[u8], exe_path: &str, out_dir: &str) {
-    let (payload_slice, payload_offset) = match unvise::pe::extract_payload(data) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
+fn extract_win(data: Vec<u8>, input: &Path, out_dir: &Path) {
+    let qdat = match unvise::pe::extract_payload(&data) {
+        Ok((payload, _)) => find_qdat(payload, input),
+        Err(e) => fail(&e.to_string()),
     };
-
-    let payload = payload_slice.to_vec();
-    let qdat = find_qdat(&payload, exe_path);
-
-    let archive = match unvise::win::WinArchive::parse(payload, qdat, payload_offset) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
+    let archive = WinArchive::from_pe(data, qdat).unwrap_or_else(|e| fail(&e.to_string()));
 
     let info = &archive.info;
     eprintln!(
@@ -113,39 +90,76 @@ fn extract_win(data: &[u8], exe_path: &str, out_dir: &str) {
     );
     eprintln!("{} entries found", info.entries.len());
     eprintln!();
-    eprintln!("Extracting to {out_dir}/");
+    eprintln!("Extracting to {}/", out_dir.display());
     eprintln!();
 
-    let result = match archive.extract(Path::new(out_dir)) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
+    let result = archive
+        .extract_with(out_dir, report)
+        .unwrap_or_else(|e| fail(&e.to_string()));
+    finish(result);
+}
+
+/// Prints one line per entry as the library works through the archive
+fn report(progress: Progress<'_>) {
+    let shown = |name| {
+        if str::is_empty(name) {
+            "(unnamed)"
+        } else {
+            name
         }
     };
+    match progress {
+        Progress::Extracted {
+            name,
+            data_len,
+            rsrc_len: Some(rsrc_len),
+        } => eprintln!("  {name} ({data_len} + {rsrc_len} bytes)"),
+        Progress::Extracted {
+            name,
+            data_len,
+            rsrc_len: None,
+        } => eprintln!("  {name} ({data_len} bytes)"),
+        Progress::Skipped {
+            name,
+            reason: SkipReason::Condition { flags },
+        } => eprintln!("  [condition] {} (flags=0x{flags:08x})", shown(name)),
+        Progress::Skipped { name, reason } => eprintln!("  [{reason}] {}", shown(name)),
+        Progress::Failed { name, error } => eprintln!("  FAIL {}: {error}", shown(name)),
+        Progress::BudgetExceeded { budget } => eprintln!(
+            "  aborting: extracted output exceeds {budget} byte budget (possible decompression bomb)"
+        ),
+        _ => {}
+    }
+}
 
+fn finish(result: unvise::ExtractResult) {
     eprintln!();
     eprintln!(
         "Done: {} extracted, {} skipped, {} failed",
         result.extracted, result.skipped, result.failed
     );
-
     if result.failed > 0 {
         process::exit(1);
     }
 }
 
+/// The directory holding `path`. A bare filename has an empty parent, which
+/// cannot be listed, so that case is the current directory
+fn containing_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
 /// Searches for a companion `.qdat` file in the same directory as the exe.
 /// Returns `None` for full installers or if no matching qdat is found
-fn find_qdat(payload: &[u8], exe_path: &str) -> Option<Vec<u8>> {
-    use unvise::win::WinArchive;
-
+fn find_qdat(payload: &[u8], input: &Path) -> Option<Vec<u8>> {
     if !WinArchive::is_stub(payload) {
         return None;
     }
     let session = WinArchive::session_id(payload)?;
-    let exe = Path::new(exe_path);
-    let dir = exe.parent()?;
+    let dir = containing_dir(input);
 
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -167,31 +181,31 @@ fn find_qdat(payload: &[u8], exe_path: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// Smallest segment file the library accepts: the SVCT header plus four bytes
+const MIN_SEGMENT_LEN: usize = 0x30;
+
 /// Scans the same directory as the archive for VISE segment files.
 /// A segment file starts with SVCT and carries a segment number > 1
 /// at offset 0x04. Reads through MacBinary wrappers
-fn find_segments(main_data: &[u8], archive_path: &str) -> Vec<Vec<u8>> {
-    let num_segments = if main_data.len() >= 0x18 && &main_data[..4] == b"SVCT" {
-        u32::from_be_bytes(main_data[0x14..0x18].try_into().unwrap_or([0; 4])) as usize
-    } else {
-        0
+///
+/// Returns the unbroken run of segments 2, 3, ... in order. File offsets
+/// count through the segments, so one after a gap or a repeat cannot be placed
+fn find_segments(main_data: &[u8], input: &Path) -> Vec<Vec<u8>> {
+    let num_segments = match main_data.get(..0x18) {
+        Some(head) if head.starts_with(b"SVCT") => {
+            u32::from_be_bytes([head[0x14], head[0x15], head[0x16], head[0x17]])
+        }
+        _ => 0,
     };
     if num_segments <= 1 {
         return Vec::new();
     }
 
-    let dir = match Path::new(archive_path).parent() {
-        Some(d) => d,
-        None => return Vec::new(),
-    };
-
-    let mut segments = Vec::new();
+    let dir = containing_dir(input);
+    let mut found: Vec<(u32, PathBuf, Vec<u8>)> = Vec::new();
     for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if path == Path::new(archive_path) {
+        if !path.is_file() || path.file_name() == input.file_name() {
             continue;
         }
 
@@ -214,48 +228,59 @@ fn find_segments(main_data: &[u8], archive_path: &str) -> Vec<Vec<u8>> {
         let Ok(data) = std::fs::read(&path) else {
             continue;
         };
-        let seg_data = if data.len() > 0x2c && &data[..4] == b"SVCT" {
+        let seg_data = if data.starts_with(b"SVCT") {
             data
-        } else if data.len() > 128 + 0x2c && &data[128..132] == b"SVCT" {
-            unvise::macbinary::strip(data)
         } else {
-            continue;
+            unvise::macbinary::strip(data)
         };
+        if seg_data.len() < MIN_SEGMENT_LEN || !seg_data.starts_with(b"SVCT") {
+            continue;
+        }
 
-        let seq = u32::from_be_bytes(seg_data[4..8].try_into().unwrap_or([0; 4]));
+        let seq = u32::from_be_bytes([seg_data[4], seg_data[5], seg_data[6], seg_data[7]]);
         if seq > 1 {
+            found.push((seq, path, seg_data));
+        }
+    }
+    found.sort_by_key(|&(seq, _, _)| seq);
+
+    let mut segments = Vec::new();
+    let mut want = 2u32;
+    for (seq, path, data) in found {
+        if seq == want {
             eprintln!("Segment {seq}: {}", path.display());
-            segments.push(seg_data);
+            segments.push(data);
+            want += 1;
+        } else {
+            eprintln!(
+                "warning: ignoring segment {seq} ({}): segment {want} is needed next",
+                path.display()
+            );
         }
     }
 
-    if !segments.is_empty() {
-        eprintln!("{} segment file(s) found", segments.len());
-    } else if num_segments > 1 {
+    if segments.is_empty() {
         eprintln!(
-            "warning: archive declares {num_segments} segments but no segment files found in {}",
+            "warning: archive declares {num_segments} segments but no usable segment files found in {}",
             dir.display()
         );
+    } else {
+        eprintln!("{} segment file(s) found", segments.len());
     }
 
     segments
 }
 
-fn count_files(archive: &Archive) -> usize {
-    archive
-        .info
-        .entries
-        .iter()
-        .filter_map(Entry::as_file)
-        .count()
-}
+#[cfg(test)]
+mod tests {
+    use super::containing_dir;
+    use std::path::Path;
 
-fn count_stubs(archive: &Archive) -> usize {
-    archive
-        .info
-        .entries
-        .iter()
-        .filter_map(Entry::as_file)
-        .filter(|f| f.is_stub())
-        .count()
+    #[test]
+    fn bare_filename_is_in_the_current_directory() {
+        assert_eq!(containing_dir(Path::new("Installer")), Path::new("."));
+        assert_eq!(containing_dir(Path::new("./Installer")), Path::new("."));
+        assert_eq!(containing_dir(Path::new("a/b/Installer")), Path::new("a/b"));
+        assert_eq!(containing_dir(Path::new("/Installer")), Path::new("/"));
+    }
 }

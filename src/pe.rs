@@ -22,33 +22,36 @@ pub fn extract_payload(data: &[u8]) -> Result<(&[u8], usize), Error> {
     }
 
     let pe_off = read_u32(data, 0x3C)? as usize;
-    if data.len() < pe_off + 24 || &data[pe_off..pe_off + 4] != b"PE\x00\x00" {
-        return Err(Error::InvalidArchive("invalid PE signature".into()));
-    }
+    // everything from the PE signature on; header offsets below are relative
+    // to it, so a pointer near the top of the address space cannot overflow
+    let pe = data
+        .get(pe_off..)
+        .filter(|pe| pe.len() >= 24 && pe.starts_with(b"PE\x00\x00"))
+        .ok_or_else(|| Error::InvalidArchive("invalid PE signature".into()))?;
 
-    let num_sections = read_u16(data, pe_off + 6)? as usize;
-    let opt_hdr_size = read_u16(data, pe_off + 20)? as usize;
-    let sec_table = pe_off
-        .checked_add(24 + opt_hdr_size)
-        .ok_or_else(|| Error::InvalidArchive("PE header offset overflow".into()))?;
+    let num_sections = read_u16(pe, 6)? as usize;
+    let opt_hdr_size = read_u16(pe, 20)? as usize;
+    let sections = pe
+        .get(24 + opt_hdr_size..)
+        .ok_or_else(|| Error::InvalidArchive("section table truncated".into()))?;
 
     let mut mvdata_off = 0usize;
     let mut mvdata_sz = 0usize;
     let mut last_end = 0usize;
 
     for i in 0..num_sections {
-        let entry = sec_table + i * 40;
-        if entry + 40 > data.len() {
-            return Err(Error::InvalidArchive("section table truncated".into()));
-        }
-        let raw_size = read_u32(data, entry + 16)? as usize;
-        let raw_off = read_u32(data, entry + 20)? as usize;
+        let entry = sections
+            .get(i * 40..)
+            .and_then(|rest| rest.get(..40))
+            .ok_or_else(|| Error::InvalidArchive("section table truncated".into()))?;
+        let raw_size = read_u32(entry, 16)? as usize;
+        let raw_off = read_u32(entry, 20)? as usize;
         let end = raw_off.saturating_add(raw_size);
         if end > last_end {
             last_end = end;
         }
 
-        if &data[entry..entry + 7] == b"_mvdata" {
+        if entry.starts_with(b"_mvdata") {
             mvdata_off = raw_off;
             mvdata_sz = raw_size;
         }
@@ -78,18 +81,19 @@ pub fn extract_payload(data: &[u8]) -> Result<(&[u8], usize), Error> {
     ))
 }
 
+fn read_array<const N: usize>(data: &[u8], off: usize) -> Result<[u8; N], Error> {
+    off.checked_add(N)
+        .and_then(|end| data.get(off..end))
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| Error::InvalidArchive(format!("PE truncated at 0x{off:x}")))
+}
+
 fn read_u16(data: &[u8], off: usize) -> Result<u16, Error> {
-    let bytes = data
-        .get(off..off + 2)
-        .ok_or_else(|| Error::InvalidArchive(format!("PE truncated at 0x{off:x}")))?;
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+    read_array(data, off).map(u16::from_le_bytes)
 }
 
 fn read_u32(data: &[u8], off: usize) -> Result<u32, Error> {
-    let bytes = data
-        .get(off..off + 4)
-        .ok_or_else(|| Error::InvalidArchive(format!("PE truncated at 0x{off:x}")))?;
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    read_array(data, off).map(u32::from_le_bytes)
 }
 
 #[cfg(test)]

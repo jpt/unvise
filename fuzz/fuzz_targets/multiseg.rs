@@ -32,5 +32,5 @@ fuzz_target!(|data: &[u8]| {
         segments.push(seg);
     }
 
-    let _ = unvise::Archive::parse_with_segments(main_data, segments);
+    let _ = unvise::Archive::parse_with_segments(main_data, &segments);
 });
