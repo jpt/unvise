@@ -5,7 +5,7 @@
 //! than relying on fixed offsets, and infers per-version name field positions
 //! dynamically from tag stride patterns
 
-use crate::{deflate, Error};
+use crate::{Error, deflate};
 
 const FVCT_FLAGS: usize = 12;
 const FVCT_TYPE: usize = 44;
@@ -128,7 +128,11 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         body_start = cvct + 4;
     }
 
-    let parse_data: &[u8] = if decompressed_body.is_empty() { data } else { &decompressed_body };
+    let parse_data: &[u8] = if decompressed_body.is_empty() {
+        data
+    } else {
+        &decompressed_body
+    };
     let tags = scan_tags(parse_data, body_start);
     let fvct_name_off = infer_name_off(parse_data, &tags, TagKind::Fvct, FVCT_NLEN);
     let dvct_name_off = infer_name_off(parse_data, &tags, TagKind::Dvct, DVCT_NLEN);
@@ -179,7 +183,12 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         }
     }
 
-    Ok(ArchiveInfo { entries, num_segments, fmt_major, fmt_minor })
+    Ok(ArchiveInfo {
+        entries,
+        num_segments,
+        fmt_major,
+        fmt_minor,
+    })
 }
 
 /// Non-directory CVCT record tags, used only for stride inference
@@ -190,7 +199,11 @@ const OTHER_TAGS: &[&[u8; 4]] = &[
 
 /// Tag type classification for scan results
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TagKind { Fvct, Dvct, Other }
+enum TagKind {
+    Fvct,
+    Dvct,
+    Other,
+}
 
 /// Scans for known CVCT tags starting at `from`. Returns (offset, kind) pairs
 /// All tag types are scanned so stride inference works even with single-record
@@ -221,7 +234,12 @@ fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, TagKind)> {
 /// When there are multiple consecutive same-type tags, stride voting across
 /// pairs gives a robust answer. For single-record archives (only one tag of a
 /// given type), falls back to using the next tag of any type as a stride bound.
-fn infer_name_off(data: &[u8], tags: &[(usize, TagKind)], target: TagKind, nlen_off: usize) -> usize {
+fn infer_name_off(
+    data: &[u8],
+    tags: &[(usize, TagKind)],
+    target: TagKind,
+    nlen_off: usize,
+) -> usize {
     // Precompute each index's next same-type tag in one reverse pass. A naive
     // inner search is O(tags^2), which a body densely packed with markers
     // (post-decompression, attacker-influenced) could exploit to stall the parser
@@ -257,19 +275,22 @@ fn infer_name_off(data: &[u8], tags: &[(usize, TagKind)], target: TagKind, nlen_
         }
     }
 
-    votes.into_iter()
+    votes
+        .into_iter()
         .max_by_key(|&(_, count)| count)
         .map_or(nlen_off + 2, |(off, _)| off)
 }
 
 fn read_u16(data: &[u8], off: usize) -> Result<u16, Error> {
-    let bytes = data.get(off..off + 2)
+    let bytes = data
+        .get(off..off + 2)
         .ok_or_else(|| Error::InvalidArchive(format!("truncated at 0x{off:x}")))?;
     Ok(u16::from_be_bytes(bytes.try_into().unwrap()))
 }
 
 fn read_u32(data: &[u8], off: usize) -> Result<u32, Error> {
-    let bytes = data.get(off..off + 4)
+    let bytes = data
+        .get(off..off + 4)
         .ok_or_else(|| Error::InvalidArchive(format!("truncated at 0x{off:x}")))?;
     Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
 }
@@ -307,9 +328,18 @@ fn mac_roman_char(b: u8) -> char {
 
 fn mac_str(data: &[u8], off: usize, len: usize) -> String {
     let bytes = &data[off..off + len];
-    let start = bytes.iter().position(|&b| b != b' ' && b != 0).unwrap_or(len);
-    let end = bytes.iter().rposition(|&b| b != b' ' && b != 0).map_or(start, |i| i + 1);
-    bytes[start..end].iter().map(|&b| mac_roman_char(b)).collect()
+    let start = bytes
+        .iter()
+        .position(|&b| b != b' ' && b != 0)
+        .unwrap_or(len);
+    let end = bytes
+        .iter()
+        .rposition(|&b| b != b' ' && b != 0)
+        .map_or(start, |i| i + 1);
+    bytes[start..end]
+        .iter()
+        .map(|&b| mac_roman_char(b))
+        .collect()
 }
 
 #[cfg(test)]
@@ -329,12 +359,7 @@ mod tests {
 
     #[test]
     fn scan_tags_finds_all_types() {
-        let data = make_tag_body(&[
-            (b"FVCT", 186),
-            (b"PACK", 26),
-            (b"BBrd", 62),
-            (b"INDN", 10),
-        ]);
+        let data = make_tag_body(&[(b"FVCT", 186), (b"PACK", 26), (b"BBrd", 62), (b"INDN", 10)]);
         let tags = scan_tags(&data, 0);
         assert_eq!(tags.len(), 4);
         assert_eq!(tags[0], (0, TagKind::Fvct));
