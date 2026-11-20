@@ -64,3 +64,24 @@ path = "fuzz_targets/name_sanitizer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "winvise"
+path = "fuzz_targets/winvise.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multiseg"
+path = "fuzz_targets/multiseg.rs"
+test = false
+doc = false
+bench = false
