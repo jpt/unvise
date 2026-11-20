@@ -116,6 +116,13 @@ pub mod fuzzing {
         }
     }
 
+    /// Parses the input as a Windows record stream, skipping the header and
+    /// runtime DLL a whole payload needs first, and reads the entries found.
+    /// The first byte selects the record layout and offset handling
+    pub fn parse_win_records(data: &[u8]) {
+        crate::win::fuzz_records(data);
+    }
+
     /// Parses a Windows VISE payload (or a whole PE) and decompresses every
     /// entry without filesystem I/O
     pub fn parse_and_decompress_win(data: &[u8]) {
