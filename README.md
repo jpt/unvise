@@ -1,6 +1,6 @@
 # unvise
 
-Extracts files from Mac and Windows **Installer VISE** archives, the installer format created by MindVision Software in the 1990s
+Extracts files from Mac and Windows Installer VISE archives, the installer format created by MindVision Software in the 1990s
 
 ## Install
 
@@ -85,10 +85,10 @@ The format version is at bytes 0x12-0x13 of the SVCT header. These are archive f
 
 Archives are structured around four chunk types:
 
-- **SVCT:** archive header at offset 0. Contains format version and a pointer to the CVCT at 0x24
-- **CVCT:** file table container. Holds a sequence of DVCT and FVCT records. v3.06+ adds a 100-byte header with chunk-type offsets (PACK, BBrd, CODE, etc.) before the record body. v3.08+ compresses the record body with word-aligned DEFLATE
-- **DVCT:** directory entry. Names the folder that subsequent files belong to
-- **FVCT:** file entry. Contains Mac type/creator codes, compressed and uncompressed sizes for both data and resource forks, and the offset to the compressed data within the archive
+- `SVCT`: archive header at offset 0. Contains format version and a pointer to the CVCT at 0x24
+- `CVCT`: file table container. Holds a sequence of DVCT and FVCT records. v3.06+ adds a 100-byte header with chunk-type offsets (PACK, BBrd, CODE, etc.) before the record body. v3.08+ compresses the record body with word-aligned DEFLATE
+- `DVCT`: directory entry. Names the folder that subsequent files belong to
+- `FVCT`: file entry. Contains Mac type/creator codes, compressed and uncompressed sizes for both data and resource forks, and the offset to the compressed data within the archive
 
 All versions use the same byte-swap + substitution cipher + DEFLATE pipeline. The v3 variant aligns stored blocks to 16-bit word boundaries. The fast path uses flate2; a custom word-aligned decoder handles the v3 variant
 
