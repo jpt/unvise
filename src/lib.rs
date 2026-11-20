@@ -15,9 +15,9 @@
 #![warn(clippy::pedantic)]
 
 pub(crate) mod deflate;
+mod mac;
 pub mod macbinary;
 pub mod pe;
-mod mac;
 pub mod win;
 
 use std::borrow::Cow;
@@ -31,26 +31,26 @@ pub use win::WinArchive;
 
 /// Detected input format for auto-dispatch
 pub enum InputKind {
-  Mac(Vec<u8>),
-  WinPe(Vec<u8>),
-  Unknown(Vec<u8>),
+    Mac(Vec<u8>),
+    WinPe(Vec<u8>),
+    Unknown(Vec<u8>),
 }
 
 /// Detects whether `data` is a Mac VISE archive, a Windows VISE PE, or unknown.
 /// Mac data is returned after `MacBinary` stripping
 #[must_use]
 pub fn detect_format(data: Vec<u8>) -> InputKind {
-  if data.len() >= 2 && &data[..2] == b"MZ" {
-    return InputKind::WinPe(data);
-  }
-  if data.len() >= 4 && &data[..4] == b"SVCT" {
-    return InputKind::Mac(data);
-  }
-  let stripped = macbinary::strip(data);
-  if stripped.len() >= 4 && &stripped[..4] == b"SVCT" {
-    return InputKind::Mac(stripped);
-  }
-  InputKind::Unknown(stripped)
+    if data.len() >= 2 && &data[..2] == b"MZ" {
+        return InputKind::WinPe(data);
+    }
+    if data.len() >= 4 && &data[..4] == b"SVCT" {
+        return InputKind::Mac(data);
+    }
+    let stripped = macbinary::strip(data);
+    if stripped.len() >= 4 && &stripped[..4] == b"SVCT" {
+        return InputKind::Mac(stripped);
+    }
+    InputKind::Unknown(stripped)
 }
 
 /// Decompression internals re-exported for the fuzz targets under the `fuzzing`
@@ -78,7 +78,10 @@ pub mod fuzzing {
             Ok(a) => a,
             Err(_) => return,
         };
-        let files: Vec<_> = archive.info.entries.iter()
+        let files: Vec<_> = archive
+            .info
+            .entries
+            .iter()
             .filter_map(super::Entry::as_file)
             .collect();
         let offset_groups = archive.build_offset_groups(&files);
@@ -90,8 +93,12 @@ pub mod fuzzing {
                 }
                 if f.comp_data > 0 {
                     let _ = archive.decompress_fork(
-                        f.data_offset, f.comp_data, f.uncomp_data,
-                        f.block_data_off, &shared_blocks, &offset_groups,
+                        f.data_offset,
+                        f.comp_data,
+                        f.uncomp_data,
+                        f.block_data_off,
+                        &shared_blocks,
+                        &offset_groups,
                     );
                 }
                 if f.comp_rsrc > 0 && f.uncomp_rsrc > 0 {
@@ -150,7 +157,11 @@ impl Archive {
     /// archive format
     pub fn parse(data: Vec<u8>) -> Result<Self, Error> {
         let info = mac::parse(&data)?;
-        Ok(Self { data, info, segments_loaded: false })
+        Ok(Self {
+            data,
+            info,
+            segments_loaded: false,
+        })
     }
 
     /// Parses a multi-segment archive. `segments` are the companion segment
@@ -165,13 +176,19 @@ impl Archive {
     pub fn parse_with_segments(data: Vec<u8>, segments: Vec<Vec<u8>>) -> Result<Self, Error> {
         let info = mac::parse(&data)?;
         if segments.is_empty() {
-            return Ok(Self { data, info, segments_loaded: false });
+            return Ok(Self {
+                data,
+                info,
+                segments_loaded: false,
+            });
         }
 
         let mut numbered: Vec<(u32, &[u8])> = Vec::new();
         for seg in &segments {
             if seg.len() < SEGMENT_DATA_START + 4 || &seg[..4] != b"SVCT" {
-                return Err(Error::InvalidArchive("segment file missing SVCT header".into()));
+                return Err(Error::InvalidArchive(
+                    "segment file missing SVCT header".into(),
+                ));
             }
             let seq = u32::from_be_bytes(seg[4..8].try_into().unwrap());
             numbered.push((seq, seg));
@@ -186,7 +203,11 @@ impl Archive {
             combined.extend_from_slice(&seg[SEGMENT_DATA_START..]);
         }
 
-        Ok(Self { data: combined, info, segments_loaded: true })
+        Ok(Self {
+            data: combined,
+            info,
+            segments_loaded: true,
+        })
     }
 
     /// Extracts all available files to `out_dir`, creating directories as needed.
@@ -199,7 +220,10 @@ impl Archive {
     pub fn extract(&self, out_dir: &Path) -> Result<ExtractResult, Error> {
         fs::create_dir_all(out_dir)?;
 
-        let files: Vec<&FileEntry> = self.info.entries.iter()
+        let files: Vec<&FileEntry> = self
+            .info
+            .entries
+            .iter()
             .filter_map(Entry::as_file)
             .collect();
 
@@ -207,9 +231,15 @@ impl Archive {
         let shared_blocks = self.decompress_shared_blocks(&files, &offset_groups);
 
         let mut cur_dir = out_dir.to_path_buf();
-        let mut result = ExtractResult { extracted: 0, skipped: 0, failed: 0 };
+        let mut result = ExtractResult {
+            extracted: 0,
+            skipped: 0,
+            failed: 0,
+        };
 
-        let output_budget = self.data.len()
+        let output_budget = self
+            .data
+            .len()
             .saturating_mul(OUTPUT_BUDGET_RATIO)
             .saturating_add(OUTPUT_BUDGET_HEADROOM);
         let mut total_out: usize = 0;
@@ -275,9 +305,17 @@ impl Archive {
         Ok(result)
     }
 
-    fn skip_reason(&self, f: &FileEntry, shared_blocks: &HashMap<usize, Vec<u8>>) -> Option<String> {
+    fn skip_reason(
+        &self,
+        f: &FileEntry,
+        shared_blocks: &HashMap<usize, Vec<u8>>,
+    ) -> Option<String> {
         if f.is_stub() {
-            let name = if f.name.is_empty() { "(unnamed)" } else { &f.name };
+            let name = if f.name.is_empty() {
+                "(unnamed)"
+            } else {
+                &f.name
+            };
             return Some(format!("[condition] {name} (flags=0x{:08x})", f.flags));
         }
         if self.info.num_segments > 1 {
@@ -309,8 +347,12 @@ impl Archive {
 
         if f.comp_data > 0 {
             let data = self.decompress_fork(
-                f.data_offset, f.comp_data, f.uncomp_data,
-                f.block_data_off, shared_blocks, offset_groups,
+                f.data_offset,
+                f.comp_data,
+                f.uncomp_data,
+                f.block_data_off,
+                shared_blocks,
+                offset_groups,
             )?;
             fs::File::create(path)?.write_all(&data)?;
             written = written.saturating_add(data.len());
@@ -355,12 +397,17 @@ impl Archive {
         offset_groups: &OffsetGroups,
     ) -> Result<Cow<'a, [u8]>, Error> {
         if let Some(result) = Self::slice_shared(
-            f.data_offset, f.block_rsrc_off, f.uncomp_rsrc, shared_blocks, offset_groups,
+            f.data_offset,
+            f.block_rsrc_off,
+            f.uncomp_rsrc,
+            shared_blocks,
+            offset_groups,
         ) {
             return result.map(Cow::Borrowed);
         }
         let rsrc_off = f.data_offset + f.comp_data;
-        self.decompress_raw(rsrc_off, f.comp_rsrc, f.uncomp_rsrc).map(Cow::Owned)
+        self.decompress_raw(rsrc_off, f.comp_rsrc, f.uncomp_rsrc)
+            .map(Cow::Owned)
     }
 
     fn decompress_fork<'a>(
@@ -372,20 +419,24 @@ impl Archive {
         shared_blocks: &'a HashMap<usize, Vec<u8>>,
         offset_groups: &OffsetGroups,
     ) -> Result<Cow<'a, [u8]>, Error> {
-        if let Some(result) = Self::slice_shared(
-            data_offset, block_off, uncomp, shared_blocks, offset_groups,
-        ) {
+        if let Some(result) =
+            Self::slice_shared(data_offset, block_off, uncomp, shared_blocks, offset_groups)
+        {
             return result.map(Cow::Borrowed);
         }
-        self.decompress_raw(data_offset, comp, uncomp).map(Cow::Owned)
+        self.decompress_raw(data_offset, comp, uncomp)
+            .map(Cow::Owned)
     }
 
     fn decompress_raw(&self, offset: usize, comp: usize, uncomp: usize) -> Result<Vec<u8>, Error> {
-        let end = offset.checked_add(comp).filter(|&e| e <= self.data.len()).ok_or_else(|| {
-            Error::Decompression(format!(
-                "data at 0x{offset:x} ({comp} bytes) exceeds archive bounds"
-            ))
-        })?;
+        let end = offset
+            .checked_add(comp)
+            .filter(|&e| e <= self.data.len())
+            .ok_or_else(|| {
+                Error::Decompression(format!(
+                    "data at 0x{offset:x} ({comp} bytes) exceeds archive bounds"
+                ))
+            })?;
         let src = &self.data[offset..end];
         deflate::decode_and_decompress(src, uncomp)
     }
@@ -393,8 +444,11 @@ impl Archive {
     fn build_offset_groups(&self, files: &[&FileEntry]) -> OffsetGroups {
         let mut groups: OffsetGroups = HashMap::new();
         for (i, f) in files.iter().enumerate() {
-            if f.comp_data > 0 && !f.is_stub()
-              && (self.info.num_segments <= 1 || (f.segment != 0 && (self.segments_loaded || f.segment == 1))) {
+            if f.comp_data > 0
+                && !f.is_stub()
+                && (self.info.num_segments <= 1
+                    || (f.segment != 0 && (self.segments_loaded || f.segment == 1)))
+            {
                 groups.entry(f.data_offset).or_default().push(i);
             }
         }
@@ -411,7 +465,9 @@ impl Archive {
         // bound the resident size of the whole cache, not just each block: a
         // crafted archive could otherwise pin many large shared blocks in memory
         // at once. Once the budget is hit, the rest decode per-entry on demand
-        let budget = self.data.len()
+        let budget = self
+            .data
+            .len()
             .saturating_mul(OUTPUT_BUDGET_RATIO)
             .saturating_add(OUTPUT_BUDGET_HEADROOM);
         let mut resident: usize = 0;
@@ -426,13 +482,19 @@ impl Archive {
             if indices.len() <= 1 {
                 continue;
             }
-            let cd = indices.iter().map(|&i| files[i].comp_data).max().unwrap_or(0);
+            let cd = indices
+                .iter()
+                .map(|&i| files[i].comp_data)
+                .max()
+                .unwrap_or(0);
             let Some(end) = off.checked_add(cd).filter(|&e| e <= self.data.len()) else {
                 continue;
             };
             if let Ok(data) = deflate::decode_and_decompress(&self.data[off..end], 0) {
                 if resident.saturating_add(data.len()) > budget {
-                    eprintln!("  shared-block cache hit {budget} byte budget; remaining blocks decode on demand");
+                    eprintln!(
+                        "  shared-block cache hit {budget} byte budget; remaining blocks decode on demand"
+                    );
                     break;
                 }
                 resident = resident.saturating_add(data.len());
@@ -481,7 +543,10 @@ mod tests {
     fn clean_name_neutralizes_traversal() {
         assert_eq!(clean_name("../../etc/passwd"), "etc/passwd");
         assert_eq!(clean_name("/etc/passwd"), "etc/passwd");
-        assert_eq!(clean_name("Macintosh HD:System:Prefs"), "Macintosh HD/System/Prefs");
+        assert_eq!(
+            clean_name("Macintosh HD:System:Prefs"),
+            "Macintosh HD/System/Prefs"
+        );
         assert_eq!(clean_name("a/../../b"), "a/b");
         assert_eq!(clean_name(".."), "");
         assert_eq!(clean_name("."), "");
@@ -490,7 +555,10 @@ mod tests {
     #[test]
     fn safe_join_rejects_escapes() {
         let base = Path::new("/out");
-        assert_eq!(safe_join(base, "sub/file.txt"), Some(PathBuf::from("/out/sub/file.txt")));
+        assert_eq!(
+            safe_join(base, "sub/file.txt"),
+            Some(PathBuf::from("/out/sub/file.txt"))
+        );
         assert_eq!(safe_join(base, "../escape"), None);
         assert_eq!(safe_join(base, "a/../b"), None);
         assert_eq!(safe_join(base, "/abs/path"), None);
