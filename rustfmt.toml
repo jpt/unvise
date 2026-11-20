@@ -1,0 +1,2 @@
+# Standard rustfmt style. Check with: cargo fmt --check
+tab_spaces = 4
