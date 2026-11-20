@@ -170,7 +170,9 @@ fn inflate_inner(
 /// Byte-pair swap + standard DEFLATE without the substitution cipher.
 /// Used by Windows VISE archives which omit the cipher table
 pub(crate) fn swap_and_inflate(src: &[u8]) -> Option<Vec<u8>> {
-    if src.len() < 2 { return None; }
+    if src.len() < 2 {
+        return None;
+    }
     let mut swapped = src.to_vec();
     for pair in swapped.chunks_exact_mut(2) {
         pair.swap(0, 1);
@@ -195,7 +197,10 @@ pub fn decompress_raw_word_deflate(input: &[u8], expected: usize) -> Result<Vec<
 }
 
 /// Byte-swap + word-aligned DEFLATE, returning input bytes consumed
-pub fn swap_and_deflate_with_consumed(input: &[u8], expected: usize) -> Result<(Vec<u8>, usize), Error> {
+pub fn swap_and_deflate_with_consumed(
+    input: &[u8],
+    expected: usize,
+) -> Result<(Vec<u8>, usize), Error> {
     let mut swapped = input.to_vec();
     for pair in swapped.chunks_exact_mut(2) {
         pair.swap(0, 1);
@@ -222,7 +227,10 @@ pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
 }
 
 /// Like [`word_deflate`], but also returns the number of input bytes consumed
-pub fn word_deflate_with_consumed(input: &[u8], expected: usize) -> Result<(Vec<u8>, usize), Error> {
+pub fn word_deflate_with_consumed(
+    input: &[u8],
+    expected: usize,
+) -> Result<(Vec<u8>, usize), Error> {
     let max_out = output_ceiling(input.len(), expected);
 
     let mut br = WordBitReader::new(input);
@@ -286,7 +294,12 @@ struct WordBitReader<'a> {
 
 impl<'a> WordBitReader<'a> {
     const fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0, bits: 0, nbits: 0 }
+        Self {
+            data,
+            pos: 0,
+            bits: 0,
+            nbits: 0,
+        }
     }
 
     #[inline]
@@ -347,7 +360,9 @@ struct HuffmanTable {
 fn build_huffman_table(lengths: &[u8]) -> HuffmanTable {
     let max_bits = u32::from(*lengths.iter().max().unwrap_or(&0));
     if max_bits == 0 {
-        return HuffmanTable { entries: vec![(0, 0); TABLE_SIZE].into_boxed_slice() };
+        return HuffmanTable {
+            entries: vec![(0, 0); TABLE_SIZE].into_boxed_slice(),
+        };
     }
 
     let mut bl_count = [0u32; 16];
@@ -381,7 +396,9 @@ fn build_huffman_table(lengths: &[u8]) -> HuffmanTable {
         }
     }
 
-    HuffmanTable { entries: entries.into_boxed_slice() }
+    HuffmanTable {
+        entries: entries.into_boxed_slice(),
+    }
 }
 
 #[inline]
@@ -415,9 +432,7 @@ static FIXED_LIT: LazyLock<HuffmanTable> = LazyLock::new(|| {
     build_huffman_table(&ll)
 });
 
-static FIXED_DIST: LazyLock<HuffmanTable> = LazyLock::new(|| {
-    build_huffman_table(&[5u8; 32])
-});
+static FIXED_DIST: LazyLock<HuffmanTable> = LazyLock::new(|| build_huffman_table(&[5u8; 32]));
 
 fn bomb_error(max_out: usize) -> Error {
     Error::Decompression(format!(
@@ -479,7 +494,9 @@ fn decode_huffman_block(
     Ok(())
 }
 
-const CL_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+const CL_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
 
 fn decode_dynamic_trees(reader: &mut WordBitReader) -> Result<(Vec<u8>, usize), Error> {
     let hlit = reader.read_bits(5) as usize + 257;
@@ -516,7 +533,11 @@ fn decode_dynamic_trees(reader: &mut WordBitReader) -> Result<(Vec<u8>, usize), 
                 let repeat = reader.read_bits(7) as usize + 11;
                 lengths.extend(std::iter::repeat_n(0u8, repeat));
             }
-            _ => return Err(Error::Decompression(format!("invalid code length symbol {sym}"))),
+            _ => {
+                return Err(Error::Decompression(format!(
+                    "invalid code length symbol {sym}"
+                )));
+            }
         }
     }
 
@@ -524,20 +545,19 @@ fn decode_dynamic_trees(reader: &mut WordBitReader) -> Result<(Vec<u8>, usize), 
 }
 
 const LEN_BASE: [u16; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
-    35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
+    163, 195, 227, 258,
 ];
 const LEN_EXTRA: [u8; 29] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
-    3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 const DIST_BASE: [u16; 30] = [
-    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
-    257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
 ];
 const DIST_EXTRA: [u8; 30] = [
-    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
-    7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
+    13,
 ];
 
 #[inline]
@@ -553,7 +573,9 @@ fn decode_length(reader: &mut WordBitReader, sym: u32) -> Result<usize, Error> {
 fn decode_distance(reader: &mut WordBitReader, sym: u32) -> Result<usize, Error> {
     let idx = sym as usize;
     if idx >= DIST_BASE.len() {
-        return Err(Error::Decompression(format!("invalid distance symbol {sym}")));
+        return Err(Error::Decompression(format!(
+            "invalid distance symbol {sym}"
+        )));
     }
     Ok(usize::from(DIST_BASE[idx]) + reader.read_bits(u32::from(DIST_EXTRA[idx])) as usize)
 }
@@ -568,7 +590,8 @@ mod tests {
     fn raw_deflate(raw: &[u8]) -> Vec<u8> {
         let mut comp = flate2::Compress::new(flate2::Compression::best(), false);
         let mut out = vec![0u8; raw.len() + 4096];
-        comp.compress(raw, &mut out, flate2::FlushCompress::Finish).unwrap();
+        comp.compress(raw, &mut out, flate2::FlushCompress::Finish)
+            .unwrap();
         #[allow(clippy::cast_possible_truncation)]
         out.truncate(comp.total_out() as usize);
         out
@@ -701,8 +724,9 @@ mod tests {
         // truncated stream could decode phantom symbols until it filled the
         // output cap (or panicked in debug); now it must terminate with an Err.
         const BODY: [u8; 32] = [
-            0x90, 0xcd, 0x0a, 0xbd, 0x60, 0x82, 0x86, 0x14, 0x4f, 0xdf, 0x24, 0x2d, 0xba, 0x0c, 0xdb, 0x04,
-            0x08, 0x2b, 0xa5, 0xa1, 0x7f, 0xc5, 0x41, 0x11, 0xa2, 0x3f, 0x03, 0x1a, 0x25, 0xa1, 0x86, 0x92,
+            0x90, 0xcd, 0x0a, 0xbd, 0x60, 0x82, 0x86, 0x14, 0x4f, 0xdf, 0x24, 0x2d, 0xba, 0x0c,
+            0xdb, 0x04, 0x08, 0x2b, 0xa5, 0xa1, 0x7f, 0xc5, 0x41, 0x11, 0xa2, 0x3f, 0x03, 0x1a,
+            0x25, 0xa1, 0x86, 0x92,
         ];
         assert!(decompress_raw_word_deflate(&BODY, 0).is_err());
     }
