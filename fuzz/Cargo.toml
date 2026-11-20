@@ -85,3 +85,10 @@ path = "fuzz_targets/multiseg.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "winvise_records"
+path = "fuzz_targets/winvise_records.rs"
+test = false
+doc = false
+bench = false

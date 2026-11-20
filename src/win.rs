@@ -1029,6 +1029,256 @@ fn resolve_vise_path(path: &str) -> String {
     result.replace('\\', "/")
 }
 
+/// Every record layout, in the order the fuzz selector byte picks them
+#[cfg(any(test, feature = "fuzzing"))]
+const ALL_FORMATS: [RecordFmt; 4] = [
+    RecordFmt::Pre4,
+    RecordFmt::Apple,
+    RecordFmt::Main4,
+    RecordFmt::Main48,
+];
+
+/// Entries read per fuzz input, so one input cannot spend its whole run
+/// decompressing the same bytes
+#[cfg(feature = "fuzzing")]
+const FUZZ_READ_LIMIT: usize = 64;
+
+/// Parses `data` as a record stream directly, without the header and runtime
+/// DLL that a whole payload needs first, then reads the entries it found.
+/// The first byte selects the record layout (bits 0-1), stub mode (bit 2),
+/// the SIVM offset base (bit 3), and whether to treat the input as its own
+/// `.qdat` volume (bit 4); the rest is the stream
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_records(data: &[u8]) {
+    let Some((&selector, stream)) = data.split_first() else {
+        return;
+    };
+    let fmt = ALL_FORMATS[usize::from(selector & 3)];
+    let flags = if selector & 4 == 0 { 0 } else { STUB_FLAG };
+    let blob_add = if selector & 8 == 0 {
+        0
+    } else {
+        SIVM_BLOB_OFFSET
+    };
+    let qdat = (selector & 16 != 0).then(|| stream.to_vec());
+    let qdat_entries = qdat.as_deref().and_then(|q| parse_qdat_entries(q).ok());
+
+    let mut entries = Vec::new();
+    let _ = parse_record_stream(
+        stream,
+        0,
+        &mut entries,
+        qdat_entries.as_deref(),
+        fmt,
+        blob_add,
+        0,
+        flags,
+    );
+
+    let archive = WinArchive {
+        payload: 0..stream.len(),
+        data: stream.to_vec(),
+        qdat,
+        info: WinArchiveInfo {
+            version: 0,
+            flags,
+            entries,
+        },
+    };
+    for entry in archive.info.entries.iter().take(FUZZ_READ_LIMIT) {
+        let _ = archive.read(entry);
+    }
+}
+
+/// Builds small, complete Windows payloads from scratch, one per record
+/// layout. They contain nothing from a real installer, so they can back
+/// tests and seed the fuzzers
+#[cfg(test)]
+mod testutil {
+    use super::RecordFmt;
+
+    pub(super) const HELLO: &[u8] = b"hello from a synthetic installer\n";
+
+    /// Raw DEFLATE with adjacent bytes swapped, as Windows VISE stores data
+    pub(super) fn swap_deflate(raw: &[u8]) -> Vec<u8> {
+        let mut comp = flate2::Compress::new(flate2::Compression::best(), false);
+        let mut out = vec![0u8; raw.len() + 64];
+        comp.compress(raw, &mut out, flate2::FlushCompress::Finish)
+            .unwrap();
+        out.truncate(usize::try_from(comp.total_out()).unwrap());
+        for pair in out.chunks_exact_mut(2) {
+            pair.swap(0, 1);
+        }
+        out
+    }
+
+    /// A stand-in for the runtime DLL, carrying only the marker that
+    /// identifies its record layout
+    pub(super) fn fake_dll(fmt: RecordFmt) -> Vec<u8> {
+        let marker: &[u8] = match fmt {
+            RecordFmt::Pre4 => b"",
+            RecordFmt::Apple => b"vise32qt.dll",
+            RecordFmt::Main4 => b"4.7.0.0",
+            RecordFmt::Main48 => b"4.9.0.0",
+        };
+        [
+            b"MZ synthetic runtime\x00".as_slice(),
+            marker,
+            b"\x00end of image\x00\x00\x00\x00",
+        ]
+        .concat()
+    }
+
+    pub(super) fn label(fmt: RecordFmt) -> &'static str {
+        match fmt {
+            RecordFmt::Pre4 => "pre4",
+            RecordFmt::Apple => "apple",
+            RecordFmt::Main4 => "main4",
+            RecordFmt::Main48 => "main48",
+        }
+    }
+
+    /// The directory the layout records for its files. Mainline layouts keep
+    /// the install path out of the stream
+    pub(super) fn directory(fmt: RecordFmt) -> &'static str {
+        match fmt {
+            RecordFmt::Pre4 | RecordFmt::Apple => "TargetDir/docs",
+            RecordFmt::Main4 | RecordFmt::Main48 => "",
+        }
+    }
+
+    fn put_u16(out: &mut Vec<u8>, v: usize) {
+        out.extend_from_slice(&u16::try_from(v).unwrap().to_le_bytes());
+    }
+
+    fn put_u32(out: &mut Vec<u8>, v: usize) {
+        out.extend_from_slice(&u32::try_from(v).unwrap().to_le_bytes());
+    }
+
+    /// An inline string: one length byte in Pre4, two elsewhere
+    fn put_inline(out: &mut Vec<u8>, fmt: RecordFmt, s: &[u8]) {
+        if fmt == RecordFmt::Pre4 {
+            out.push(u8::try_from(s.len()).unwrap());
+        } else {
+            put_u16(out, s.len());
+        }
+        out.extend_from_slice(s);
+    }
+
+    /// A record's type tag and an all-zero common header, which declares no
+    /// features and no conditions
+    fn record_start(fmt: RecordFmt, rtype: usize) -> Vec<u8> {
+        let common = match fmt {
+            RecordFmt::Pre4 => 97,
+            RecordFmt::Apple | RecordFmt::Main4 => 99,
+            RecordFmt::Main48 => 100,
+        };
+        let mut r = Vec::new();
+        put_u32(&mut r, rtype);
+        r.resize(4 + common, 0);
+        r
+    }
+
+    /// A type 2 (file) record
+    fn file_record(fmt: RecordFmt, name: &str, uncomp: usize, comp: usize, blob: usize) -> Vec<u8> {
+        let mut r = record_start(fmt, 2);
+        // name, then a zero count of localized variants
+        put_u16(&mut r, name.len());
+        r.extend_from_slice(name.as_bytes());
+        put_u16(&mut r, 0);
+        // alternate name, empty
+        put_inline(&mut r, fmt, b"");
+        if matches!(fmt, RecordFmt::Pre4 | RecordFmt::Apple) {
+            put_inline(&mut r, fmt, b"%TargetDir%\\docs");
+        }
+        put_u32(&mut r, uncomp);
+        put_u32(&mut r, comp);
+        put_u32(&mut r, 0); // volume
+        put_u32(&mut r, blob);
+        r.resize(r.len() + 4 + 24 + 9, 0);
+        put_inline(&mut r, fmt, b"");
+        r.resize(r.len() + 26, 0);
+        match fmt {
+            RecordFmt::Pre4 => r.resize(r.len() + 4, 0),
+            RecordFmt::Apple => {
+                r.push(0);
+                put_inline(&mut r, fmt, b"");
+                r.resize(r.len() + 1 + 9, 0);
+            }
+            RecordFmt::Main4 | RecordFmt::Main48 => {
+                r.push(0);
+                put_inline(&mut r, fmt, b"");
+                r.resize(r.len() + 1 + 10, 0);
+            }
+        }
+        r
+    }
+
+    /// Three records: a file, a one-byte record of another type, and an
+    /// empty file. `blob_field` is what the first file's offset field holds
+    fn record_stream(fmt: RecordFmt, comp: usize, blob_field: usize) -> Vec<u8> {
+        let mut s = Vec::new();
+        put_u32(&mut s, 3);
+        s.extend(file_record(fmt, "hello.txt", HELLO.len(), comp, blob_field));
+        s.extend(record_start(fmt, 0x0d));
+        s.push(0);
+        s.extend(file_record(fmt, "empty.dat", 0, 0, 0));
+        s
+    }
+
+    /// A whole payload: header, a one-entry DLL chain, the record stream, then
+    /// the file data. `payload_file_offset` is where the payload would sit in
+    /// its executable, which Pre4 offsets are measured from
+    pub(super) fn payload(fmt: RecordFmt, payload_file_offset: usize) -> Vec<u8> {
+        let blob = swap_deflate(HELLO);
+        let dll = swap_deflate(&fake_dll(fmt));
+
+        // the Apple fork wraps the ESIV header in a SIVM one
+        let sivm = fmt == RecordFmt::Apple;
+        let mut out = Vec::new();
+        if sivm {
+            out.extend_from_slice(b"SIVM");
+            put_u32(&mut out, 0);
+        }
+        out.extend_from_slice(b"ESIV");
+        put_u32(&mut out, 0x5E55_1011); // session id
+        put_u32(&mut out, 1); // version
+        put_u32(&mut out, 0); // flags
+        out.resize(out.len() + 8, 0); // installer metadata
+
+        let name = b"vise32ex.dll";
+        out.push(u8::try_from(name.len()).unwrap());
+        out.extend_from_slice(name);
+        out.resize(out.len() + 12, 0);
+        put_u32(&mut out, dll.len());
+        out.extend_from_slice(&dll);
+        out.push(0); // ends the chain
+
+        let stream_len = record_stream(fmt, blob.len(), 0).len();
+        let blob_at = out.len() + stream_len;
+        let blob_field = match fmt {
+            RecordFmt::Pre4 => blob_at + payload_file_offset,
+            RecordFmt::Apple => blob_at - super::SIVM_BLOB_OFFSET,
+            RecordFmt::Main4 | RecordFmt::Main48 => blob_at,
+        };
+        out.extend(record_stream(fmt, blob.len(), blob_field));
+        out.extend_from_slice(&blob);
+        out
+    }
+
+    /// Input for the record-stream fuzz target: the selector byte for `fmt`,
+    /// the stream, then the file data it points at
+    pub(super) fn records_input(fmt: RecordFmt) -> Vec<u8> {
+        let blob = swap_deflate(HELLO);
+        let stream_len = record_stream(fmt, blob.len(), 0).len();
+        let selector = super::ALL_FORMATS.iter().position(|&f| f == fmt).unwrap();
+        let mut out = vec![u8::try_from(selector).unwrap()];
+        out.extend(record_stream(fmt, blob.len(), stream_len));
+        out.extend_from_slice(&blob);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1099,6 +1349,105 @@ mod tests {
             Err(Error::Skipped(SkipReason::MissingQdat))
         ));
         assert_eq!(archive.read(&entry(0, 0, 0, false)).unwrap(), b"");
+    }
+
+    #[test]
+    fn parses_and_reads_each_runtime_variant() {
+        for fmt in ALL_FORMATS {
+            let archive = WinArchive::parse(testutil::payload(fmt, 0), None, 0)
+                .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(fmt)));
+            let entries = &archive.info.entries;
+            let paths: Vec<String> = entries.iter().map(WinEntry::path).collect();
+            let dir = testutil::directory(fmt);
+            let in_dir = |name: &str| {
+                if dir.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{dir}/{name}")
+                }
+            };
+            assert_eq!(
+                paths,
+                [
+                    "vise32ex.dll".to_string(),
+                    in_dir("hello.txt"),
+                    in_dir("empty.dat")
+                ],
+                "{}",
+                testutil::label(fmt)
+            );
+
+            assert_eq!(archive.read(&entries[0]).unwrap(), testutil::fake_dll(fmt));
+            assert_eq!(archive.read(&entries[1]).unwrap(), testutil::HELLO);
+            assert_eq!(entries[1].uncompressed_len, testutil::HELLO.len());
+            assert_eq!(archive.read(&entries[2]).unwrap(), b"");
+        }
+    }
+
+    #[test]
+    fn pre4_offsets_are_measured_from_the_file_start() {
+        let at = 0x4000;
+        let archive = WinArchive::parse(testutil::payload(RecordFmt::Pre4, at), None, at).unwrap();
+        assert_eq!(
+            archive.read(&archive.info.entries[1]).unwrap(),
+            testutil::HELLO
+        );
+        // the same payload read as if it sat at offset 0 points past its data
+        let wrong = WinArchive::parse(testutil::payload(RecordFmt::Pre4, at), None, 0).unwrap();
+        assert!(wrong.read(&wrong.info.entries[1]).is_err());
+    }
+
+    #[test]
+    fn extracts_a_synthetic_installer_to_disk() {
+        let fmt = RecordFmt::Apple;
+        let archive = WinArchive::parse(testutil::payload(fmt, 0), None, 0).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = archive.extract(tmp.path()).unwrap();
+        assert_eq!(result.extracted, 3);
+        assert_eq!(result.failed, 0);
+
+        let docs = tmp.path().join(testutil::directory(fmt));
+        assert_eq!(fs::read(docs.join("hello.txt")).unwrap(), testutil::HELLO);
+        assert_eq!(fs::read(docs.join("empty.dat")).unwrap(), b"");
+        assert_eq!(
+            fs::read(tmp.path().join("vise32ex.dll")).unwrap(),
+            testutil::fake_dll(fmt)
+        );
+    }
+
+    #[test]
+    fn record_stream_parses_without_a_payload_around_it() {
+        // the shape the record-stream fuzz target feeds in
+        for fmt in ALL_FORMATS {
+            let input = testutil::records_input(fmt);
+            let stream = &input[1..];
+            let mut entries = Vec::new();
+            parse_record_stream(stream, 0, &mut entries, None, fmt, 0, 0, 0)
+                .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(fmt)));
+            assert_eq!(entries.len(), 2, "{}", testutil::label(fmt));
+            let blob = &stream[entries[0].offset..][..entries[0].compressed_len];
+            assert_eq!(blob, testutil::swap_deflate(testutil::HELLO));
+        }
+    }
+
+    /// Writes the synthetic payloads into the fuzz corpora as seeds. They are
+    /// what gets the fuzzers past the header and runtime-DLL checks. Run with:
+    /// `cargo test -- --ignored write_fuzz_seeds`
+    #[test]
+    #[ignore = "writes files under fuzz/corpus"]
+    fn write_fuzz_seeds() {
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
+        for fmt in ALL_FORMATS {
+            let name = format!("synthetic-{}", testutil::label(fmt));
+            for (target, bytes) in [
+                ("winvise", testutil::payload(fmt, 0)),
+                ("winvise_records", testutil::records_input(fmt)),
+            ] {
+                let dir = corpus.join(target);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join(&name), bytes).unwrap();
+            }
+        }
     }
 
     #[test]

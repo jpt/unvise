@@ -11,6 +11,7 @@ Coverage-guided targets over the untrusted-input surface, via [`cargo-fuzz`](htt
 | `word_deflate`   | `deflate::word_deflate` - word-aligned DEFLATE, no cipher           |
 | `name_sanitizer` | `clean_name` then `safe_join` - path traversal guard               |
 | `winvise`        | `WinArchive::parse` / `from_pe` + `read` - Windows VISE record stream |
+| `winvise_records` | `parse_record_stream` + `read` - record layouts, without a payload around them |
 | `pe`             | `pe::extract_payload` - PE section table parsing                    |
 
 `archive` is the primary Mac target: it tests the interaction between parsed headers and the decompressor, including shared-block caching, offset groups, and fork slicing, without filesystem I/O. `winvise` is the primary Windows target: it exercises the typed record stream parser and DEFLATE decompression. `deflate` and `word_deflate` read the first 4 bytes as the declared uncompressed size (the attacker-controlled field) and the rest as the body
@@ -22,7 +23,13 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 ```
 
-No seed corpus is included. To seed a target, copy archives you have the right to use into `fuzz/corpus/<target>/` (`parse` and `macbinary` take whole archives)
+No seed corpus is checked in. The Windows targets need seeds to get anywhere: a payload must carry a valid compressed runtime DLL before its records are parsed, and a fuzzer does not find that on its own. Small synthetic payloads, one per runtime variant and built from scratch by the test suite, are written into `fuzz/corpus/winvise/` and `fuzz/corpus/winvise_records/` with:
+
+```sh
+cargo test -- --ignored write_fuzz_seeds
+```
+
+To seed the Mac targets, copy archives you have the right to use into `fuzz/corpus/<target>/` (`parse` and `macbinary` take whole archives)
 
 ## Run
 

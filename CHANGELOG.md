@@ -8,7 +8,9 @@
 - `Archive::files`, `FileEntry::has_rsrc`, `WinEntry::path`, and `WinArchive::from_pe`, which takes the whole executable
 - `Error::Skipped` for entries that have no data in the archive
 - `--help`
-- End-to-end tests that build small archives in memory
+- End-to-end tests that build small archives in memory, Mac and Windows, with no third-party files
+- `winvise_records` fuzz target, which fuzzes the Windows record stream directly
+- `cargo test -- --ignored write_fuzz_seeds` writes synthetic payloads into the Windows fuzz corpora
 - CI running `cargo fmt --check`, clippy, and the tests
 
 ### Changed
