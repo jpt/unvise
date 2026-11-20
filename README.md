@@ -36,19 +36,21 @@ unvise installer.bin output/
 
 ### Example output
 
+Illustrative output. Sizes are data fork + resource fork:
+
 ```
 VISE format: 03 03
-CVCT: 87 entries, 1 segments
-87 extractable, 0 condition records
+CVCT: 12 entries, 1 segments
+12 extractable, 0 condition records
 
 Extracting to output/
 
-  Example App (2863460 + 78667 bytes)
-  addpreset.dat (45143 + 0 bytes)
-  billboard.dat (61531 + 0 bytes)
+  Example App (412876 + 30212 bytes)
+  Read Me (4821 + 0 bytes)
+  presets.dat (45143 + 0 bytes)
   ...
 
-Done: 87 extracted, 0 skipped, 0 failed
+Done: 12 extracted, 0 skipped, 0 failed
 ```
 
 ## Source layout
@@ -111,7 +113,7 @@ File data is stored as DEFLATE with a byte-pair swap applied to the compressed s
 
 ### Multi-segment installers
 
-Some installers span multiple files. On Mac, each FVCT entry carries a segment number; multi-segment Mac archives are not yet supported (files on missing segments are reported and skipped). On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
+Some installers span multiple files. On Mac, segment files are discovered automatically in the same directory as the main archive and concatenated by sequence number. On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
 
 ## Testing
 
@@ -124,6 +126,14 @@ cargo test
 ## Acknowledgements
 
 This software package is dedicated to the memory of Tyler Kellen
+
+## Disclaimer
+
+This software is provided AS-IS and without any express or implied warranties of safety or suitability for any purpose. Use of this software does not give you the right to access, copy, or use the archived materials; by using this software, you confirm that you have the legal right to access the archived materials, via license or otherwise. By using this software, you agree you are solely responsible for compliance with applicable laws and EULAs. You expressly hold the developers of this software harmless for any misuse or violations resulting from your use of the tool
+
+## Trademarks
+
+"Installer VISE," "MindVision," "Apple," "Mac," "Macintosh," "Microsoft," "Windows," and any other trademarks used throughout this project remain the property of their respective owners and are used herein for identification purposes only
 
 ## License
 
