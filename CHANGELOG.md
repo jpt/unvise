@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+- Read entries into memory: `Archive::reader` and `Archive::read` return both forks of a Mac entry, `WinArchive::read` returns a Windows entry
+- `extract_with` on both archive types reports each entry through a callback (`Progress`), with a typed `SkipReason`
+- `Archive::files`, `FileEntry::has_rsrc`, `WinEntry::path`, and `WinArchive::from_pe`, which takes the whole executable
+- `Error::Skipped` for entries that have no data in the archive
+- `--help`
+- End-to-end tests that build small archives in memory
+- CI running `cargo fmt --check`, clippy, and the tests
+
+### Changed
+- The library no longer prints; the CLI does all output. Reported names are paths relative to the output directory
+- `Archive::parse_with_segments` takes `&[Vec<u8>]` and rejects segment sets with gaps or repeats. The CLI uses the unbroken run from segment 2 and warns about the rest
+- Shared blocks are decompressed one at a time, so peak memory follows the largest block instead of the total
+- Huffman tables are sized per block with a 10-bit fast path. A stream of many tiny dynamic blocks decodes about 70 times faster
+- Stored blocks are copied in one step, and output buffers start at the declared size instead of 1 MB
+- Windows extraction no longer copies the payload out of the executable
+- Public structs and enums are `#[non_exhaustive]`
+
+### Fixed
+- Apple-variant runtime detection never matched, because a 9-byte window was compared with an 8-byte string. Those installers parsed only through the fallback order
+- A bare filename (`unvise Installer`) never found segment files or the `.qdat`
+- The word-aligned decoder accepted output shorter than the declared size
+- A stored block cut off by the end of input was padded with zeros
+- Mac files with both forks empty were not created
+- Windows entries are now checked against the size in the file table
+- The `winvise` fuzz target never reached decompression
+- Offset arithmetic on header fields could wrap on 32-bit targets
+- Non-UTF-8 paths on the command line caused a panic
+
 ## 0.2.1
 
 ### Added
