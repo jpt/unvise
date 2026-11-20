@@ -22,6 +22,8 @@ rustup toolchain install nightly
 cargo install cargo-fuzz
 ```
 
+No seed corpus is included. To seed a target, copy archives you have the right to use into `fuzz/corpus/<target>/` (`parse` and `macbinary` take whole archives)
+
 ## Run
 
 ```sh
