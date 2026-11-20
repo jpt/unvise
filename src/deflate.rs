@@ -28,13 +28,13 @@ const MAX_EXPANSION_RATIO: usize = 1032;
 const MAX_MATCH: usize = 258;
 /// Output chunk pulled from flate2 per iteration when decompressing incrementally
 const INFLATE_CHUNK: usize = 64 * 1024;
-/// Starting output capacity. A growth hint only, never sized from the declared
-/// `expected`, so a bogus header can't request a huge reservation up front
+/// Ceiling on the starting output capacity. The declared `expected` is used as
+/// a hint only up to this, so a bogus header can't request a huge reservation
+/// up front
 const INITIAL_OUTPUT_CAP: usize = 1 << 20;
 
-/// Substitution table shared across all observed VISE versions.
-///
-/// A bijective 256-byte permutation applied to the compressed data
+/// Substitution table: a bijective 256-byte permutation applied to the
+/// compressed data in Mac archives
 pub const CIPHER: [u8; 256] = [
     0x6a, 0xb7, 0x36, 0xec, 0x15, 0xd9, 0xc8, 0x73, 0xe8, 0x38, 0x9a, 0xdf, 0x21, 0x25, 0xd0, 0xcc,
     0xfd, 0xdc, 0x16, 0xd7, 0xe3, 0x43, 0x05, 0xc5, 0x8f, 0x48, 0xda, 0xf2, 0x3f, 0x10, 0x23, 0x6c,
@@ -107,7 +107,12 @@ fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
     }
 
     let max_out = output_ceiling(input.len(), expected);
-    let mut out = Vec::with_capacity(INITIAL_OUTPUT_CAP.min(max_out));
+    let hint = if expected > 0 {
+        expected
+    } else {
+        input.len().saturating_mul(4)
+    };
+    let mut out = Vec::with_capacity(hint.min(INITIAL_OUTPUT_CAP).min(max_out));
 
     let result = SCRATCH.with(|scratch_cell| {
         DEC.with(|dec_cell| {
@@ -222,6 +227,14 @@ fn output_ceiling(comp_len: usize, expected: usize) -> usize {
     }
 }
 
+/// Decompresses word-aligned DEFLATE. `expected` is the declared output size,
+/// or 0 when it is unknown
+///
+/// # Errors
+///
+/// Returns [`Error::Decompression`] if the stream is malformed, ends before
+/// `expected` bytes are produced, or expands past what its input could
+/// legitimately produce
 pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     word_deflate_with_consumed(input, expected).map(|(data, _)| data)
 }
@@ -254,12 +267,7 @@ pub fn word_deflate_with_consumed(
                 if out.len() + len > max_out {
                     return Err(bomb_error(max_out));
                 }
-                for _ in 0..len {
-                    #[allow(clippy::cast_possible_truncation)]
-                    out.push(br.read_bits(8) as u8);
-                }
-                // Odd stored length leaves us mid-word; realign
-                br.align16();
+                br.copy_stored(len, &mut out)?;
             }
             1 => decode_huffman_block(&mut br, &mut out, true, max_out)?,
             2 => decode_huffman_block(&mut br, &mut out, false, max_out)?,
@@ -280,6 +288,12 @@ pub fn word_deflate_with_consumed(
     }
 
     if expected > 0 {
+        if out.len() < expected {
+            return Err(Error::Decompression(format!(
+                "stream ended after {} of {expected} bytes",
+                out.len()
+            )));
+        }
         out.truncate(expected);
     }
     Ok((out, br.pos))
@@ -348,56 +362,125 @@ impl<'a> WordBitReader<'a> {
             self.nbits -= discard;
         }
     }
+
+    /// Copies the `len` bytes of a stored block to `out`, then skips the pad
+    /// byte that follows an odd-length run so the next block starts on a
+    /// 16-bit boundary. Call after the LEN/NLEN words have been read
+    ///
+    /// Errors if the input ends before `len` bytes are available
+    fn copy_stored(&mut self, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
+        let mut remaining = len;
+        // whole bytes already pulled into the bit buffer come first
+        while remaining > 0 && self.nbits >= 8 {
+            #[allow(clippy::cast_possible_truncation)]
+            out.push(self.bits as u8);
+            self.bits >>= 8;
+            self.nbits -= 8;
+            remaining -= 1;
+        }
+        if remaining > 0 {
+            // the buffer holds no whole byte, so the rest is copied straight
+            // from the input
+            self.bits = 0;
+            self.nbits = 0;
+            let end = self
+                .pos
+                .checked_add(remaining)
+                .filter(|&e| e <= self.data.len())
+                .ok_or_else(|| {
+                    Error::Decompression("stored block runs past end of input".into())
+                })?;
+            out.extend_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+        }
+        if len % 2 == 1 {
+            if self.nbits >= 8 {
+                self.bits >>= 8;
+                self.nbits -= 8;
+            } else if self.pos < self.data.len() {
+                self.pos += 1;
+            }
+        }
+        self.align16();
+        Ok(())
+    }
 }
 
-const TABLE_BITS: u32 = 15;
-const TABLE_SIZE: usize = 1 << TABLE_BITS;
+/// Longest Huffman code DEFLATE allows
+const MAX_CODE_BITS: u32 = 15;
+/// Codes up to this many bits resolve with a single table lookup. Longer
+/// codes are rare and take the bit-by-bit canonical path, which keeps the
+/// per-block table small: a stream of tiny blocks cannot force a large table
+/// to be rebuilt for each one
+const FAST_BITS: u32 = 10;
 
 struct HuffmanTable {
-    entries: Box<[(u16, u8)]>,
+    /// `(symbol, code length)` indexed by the next input bits. Length 0 marks
+    /// the prefix of a longer code, or no code at all
+    fast: Box<[(u16, u8)]>,
+    fast_mask: u32,
+    /// Number of codes of each length, for the canonical path
+    count: [u16; MAX_CODE_BITS as usize + 1],
+    /// Symbols ordered by code length, then by symbol value
+    symbols: Box<[u16]>,
 }
 
+/// Builds a decoding table from per-symbol code lengths (each 0..=15)
 fn build_huffman_table(lengths: &[u8]) -> HuffmanTable {
-    let max_bits = u32::from(*lengths.iter().max().unwrap_or(&0));
-    if max_bits == 0 {
-        return HuffmanTable {
-            entries: vec![(0, 0); TABLE_SIZE].into_boxed_slice(),
-        };
-    }
+    const N: usize = MAX_CODE_BITS as usize + 1;
 
-    let mut bl_count = [0u32; 16];
+    let mut count = [0u16; N];
     for &len in lengths {
         if len > 0 {
-            bl_count[usize::from(len)] += 1;
+            count[usize::from(len)] += 1;
         }
     }
+    let max_bits = (1..N).rev().find(|&b| count[b] > 0).unwrap_or(0);
+    #[allow(clippy::cast_possible_truncation)]
+    let fast_bits = (max_bits as u32).min(FAST_BITS);
 
-    let mut next_code = [0u32; 16];
+    // first canonical code of each length, and where each length's symbols
+    // start in the sorted list
+    let mut next_code = [0u32; N];
+    let mut offset = [0usize; N];
     let mut code = 0u32;
-    for bits in 1..=max_bits {
-        code = (code + bl_count[bits as usize - 1]) << 1;
-        next_code[bits as usize] = code;
+    for bits in 1..N {
+        code = (code + u32::from(count[bits - 1])) << 1;
+        next_code[bits] = code;
+        offset[bits] = offset[bits - 1] + usize::from(count[bits - 1]);
     }
 
-    let mut entries = vec![(0u16, 0u8); TABLE_SIZE];
+    let coded = lengths.iter().filter(|&&len| len > 0).count();
+    let mut symbols = vec![0u16; coded];
+    let mut fast = vec![(0u16, 0u8); 1usize << fast_bits];
+
     for (sym, &len) in lengths.iter().enumerate() {
         if len == 0 {
             continue;
         }
-        let c = next_code[usize::from(len)];
-        next_code[usize::from(len)] += 1;
-        let rev = reverse_bits(c, len);
-        let fill = TABLE_BITS - u32::from(len);
-        for i in 0..(1u32 << fill) {
-            let idx = rev as usize | ((i as usize) << len);
-            #[allow(clippy::cast_possible_truncation)]
-            let sym = sym as u16;
-            entries[idx] = (sym, len);
+        #[allow(clippy::cast_possible_truncation)]
+        let sym = sym as u16;
+        let slot = usize::from(len);
+        symbols[offset[slot]] = sym;
+        offset[slot] += 1;
+
+        let c = next_code[slot];
+        next_code[slot] += 1;
+        if u32::from(len) > fast_bits {
+            continue;
+        }
+        let mut idx = reverse_bits(c, len) as usize;
+        while idx < fast.len() {
+            fast[idx] = (sym, len);
+            idx += 1usize << len;
         }
     }
 
     HuffmanTable {
-        entries: entries.into_boxed_slice(),
+        fast: fast.into_boxed_slice(),
+        fast_mask: (1u32 << fast_bits) - 1,
+        count,
+        symbols: symbols.into_boxed_slice(),
     }
 }
 
@@ -408,10 +491,8 @@ fn reverse_bits(val: u32, len: u8) -> u32 {
 
 #[inline]
 fn decode_symbol(reader: &mut WordBitReader, table: &HuffmanTable) -> Result<u32, Error> {
-    reader.ensure_bits(TABLE_BITS);
-    #[allow(clippy::cast_possible_truncation)]
-    let peek = (reader.bits & (TABLE_SIZE as u32 - 1)) as usize;
-    let (sym, len) = table.entries[peek];
+    reader.ensure_bits(MAX_CODE_BITS);
+    let (sym, len) = table.fast[(reader.bits & table.fast_mask) as usize];
     // Require the matched code to fit within the bits actually read from input.
     // At end-of-input ensure_bits pads with zeros; without this check a truncated
     // stream would decode phantom symbols forever and underflow nbits.
@@ -419,6 +500,33 @@ fn decode_symbol(reader: &mut WordBitReader, table: &HuffmanTable) -> Result<u32
         reader.bits >>= len;
         reader.nbits -= u32::from(len);
         return Ok(u32::from(sym));
+    }
+    decode_symbol_canonical(reader, table)
+}
+
+/// Decodes one symbol a bit at a time from the code-length counts. Handles the
+/// codes too long for the fast table, and reports anything that is not a code.
+/// Only bits actually read from the input are considered
+#[cold]
+fn decode_symbol_canonical(reader: &mut WordBitReader, table: &HuffmanTable) -> Result<u32, Error> {
+    let mut code = 0u32;
+    let mut first = 0u32;
+    let mut index = 0usize;
+    for len in 1..=reader.nbits.min(MAX_CODE_BITS) {
+        code |= (reader.bits >> (len - 1)) & 1;
+        let count = u32::from(table.count[len as usize]);
+        if code < first + count {
+            let sym = table
+                .symbols
+                .get(index + (code - first) as usize)
+                .ok_or_else(|| Error::Decompression("invalid Huffman code".into()))?;
+            reader.bits >>= len;
+            reader.nbits -= len;
+            return Ok(u32::from(*sym));
+        }
+        index += count as usize;
+        first = (first + count) << 1;
+        code <<= 1;
     }
     Err(Error::Decompression("invalid Huffman code".into()))
 }
@@ -595,6 +703,193 @@ mod tests {
         #[allow(clippy::cast_possible_truncation)]
         out.truncate(comp.total_out() as usize);
         out
+    }
+
+    /// Packs values least-significant bit first, the order DEFLATE uses
+    struct BitWriter {
+        out: Vec<u8>,
+        acc: u64,
+        n: u32,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                out: Vec::new(),
+                acc: 0,
+                n: 0,
+            }
+        }
+
+        fn put(&mut self, val: u32, bits: u32) {
+            self.acc |= u64::from(val) << self.n;
+            self.n += bits;
+            while self.n >= 8 {
+                self.out.push((self.acc & 0xff) as u8);
+                self.acc >>= 8;
+                self.n -= 8;
+            }
+        }
+
+        /// Writes a Huffman code, which goes out most-significant bit first
+        fn put_code(&mut self, code: u32, len: u8) {
+            self.put(reverse_bits(code, len), u32::from(len));
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.out.push((self.acc & 0xff) as u8);
+            }
+            self.out
+        }
+    }
+
+    /// A stored block in the word-aligned layout: the 3 header bits are padded
+    /// to a 16-bit word, and an odd-length run is followed by one pad byte
+    fn stored_block(data: &[u8], last: bool) -> Vec<u8> {
+        let len = u16::try_from(data.len()).unwrap();
+        let mut out = vec![u8::from(last), 0];
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(0xEE);
+        }
+        out
+    }
+
+    #[test]
+    fn stored_blocks_realign_after_odd_lengths() {
+        let mut input = stored_block(b"odd", false);
+        input.extend(stored_block(b"even", false));
+        input.extend(stored_block(b"x", true));
+        assert_eq!(word_deflate(&input, 0).unwrap(), b"oddevenx");
+        assert_eq!(word_deflate(&input, 8).unwrap(), b"oddevenx");
+        let (_, consumed) = word_deflate_with_consumed(&input, 0).unwrap();
+        assert_eq!(consumed, input.len());
+    }
+
+    #[test]
+    fn truncated_stored_block_is_an_error() {
+        // the block declares 1000 bytes; only 10 follow. The missing bytes must
+        // not be invented
+        let mut input = stored_block(&[0xAA; 1000], true);
+        input.truncate(6 + 10);
+        let Err(Error::Decompression(msg)) = word_deflate(&input, 0) else {
+            panic!("expected a decompression error");
+        };
+        assert!(msg.contains("past end of input"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn short_output_is_an_error() {
+        // a complete stream that holds fewer bytes than the header declared
+        let input = stored_block(b"four", true);
+        assert_eq!(word_deflate(&input, 4).unwrap(), b"four");
+        let Err(Error::Decompression(msg)) = word_deflate(&input, 1000) else {
+            panic!("expected a decompression error");
+        };
+        assert!(msg.contains("4 of 1000"), "unexpected error: {msg}");
+        // the cipher-layer entry point reports it too, not a short success
+        assert!(decode_and_decompress(&[0u8; 8], 1000).is_err());
+    }
+
+    #[test]
+    fn decodes_codes_longer_than_the_fast_table() {
+        // a complete code with lengths 1 through 15: symbol i has length i + 1,
+        // and the last two symbols share the longest length
+        let lengths: Vec<u8> = (1..=15).chain([15]).collect();
+        assert!(u32::from(*lengths.iter().max().unwrap()) > FAST_BITS);
+        let table = build_huffman_table(&lengths);
+
+        // canonical codes, as the table builder assigns them
+        let mut codes = vec![0u32; lengths.len()];
+        let mut code = 0u32;
+        let mut prev = lengths[0];
+        for (sym, &len) in lengths.iter().enumerate() {
+            code <<= len - prev;
+            codes[sym] = code;
+            code += 1;
+            prev = len;
+        }
+
+        let order: Vec<usize> = (0..lengths.len()).chain((0..lengths.len()).rev()).collect();
+        let mut w = BitWriter::new();
+        for &sym in &order {
+            w.put_code(codes[sym], lengths[sym]);
+        }
+        let input = w.finish();
+
+        let mut reader = WordBitReader::new(&input);
+        for &sym in &order {
+            let got = decode_symbol(&mut reader, &table).unwrap();
+            assert_eq!(got as usize, sym);
+        }
+        // what is left is zero padding, which reads as the 1-bit code for
+        // symbol 0 until the input runs out
+        let mut leftover = 0;
+        while let Ok(sym) = decode_symbol(&mut reader, &table) {
+            assert_eq!(sym, 0);
+            leftover += 1;
+        }
+        assert!(leftover < 8);
+    }
+
+    #[test]
+    fn skewed_data_roundtrips_through_long_codes() {
+        // byte frequencies fall off geometrically, which drives the rarest
+        // symbols to code lengths past the fast table
+        let mut state = 0x2545_F491u32;
+        let raw: Vec<u8> = (0..300_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let r = state >> 8;
+                // leading_zeros of a 24-bit value gives a geometric spread
+                let bucket = (r | 1).trailing_zeros().min(23);
+                u8::try_from(bucket * 9 + ((r >> 12) % 9)).unwrap()
+            })
+            .collect();
+        let compressed = raw_deflate(&raw);
+        assert!(compressed.len() < raw.len());
+        assert_eq!(word_deflate(&compressed, raw.len()).unwrap(), raw);
+    }
+
+    /// One dynamic-Huffman block that emits the single literal `A`. The
+    /// literal alphabet is `A` and end-of-block, one bit each
+    fn tiny_dynamic_block(w: &mut BitWriter, last: bool) {
+        w.put(u32::from(last), 1);
+        w.put(2, 2); // dynamic Huffman
+        w.put(0, 5); // 257 literal/length codes
+        w.put(0, 5); // 1 distance code
+        w.put(14, 4); // 18 code-length codes
+        for &sym in CL_ORDER.iter().take(18) {
+            w.put(u32::from(sym == 18 || sym == 1), 3);
+        }
+        // code-length alphabet: symbol 1 is code 0, symbol 18 is code 1
+        w.put(1, 1);
+        w.put(65 - 11, 7); // 65 zero lengths, symbols 0..=64
+        w.put(0, 1); // 'A' gets length 1
+        w.put(1, 1);
+        w.put(138 - 11, 7);
+        w.put(1, 1);
+        w.put(52 - 11, 7); // zeros through symbol 255
+        w.put(0, 1); // end-of-block gets length 1
+        w.put(0, 1); // the one distance code gets length 1
+        w.put(0, 1); // 'A'
+        w.put(1, 1); // end of block
+    }
+
+    #[test]
+    fn many_tiny_dynamic_blocks_decode() {
+        // each block carries its own code tables; the per-block cost has to stay
+        // small or a stream of these stalls the decoder
+        let blocks = 5_000;
+        let mut w = BitWriter::new();
+        for i in 0..blocks {
+            tiny_dynamic_block(&mut w, i + 1 == blocks);
+        }
+        let out = word_deflate(&w.finish(), blocks).unwrap();
+        assert_eq!(out, vec![b'A'; blocks]);
     }
 
     #[test]

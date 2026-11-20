@@ -30,6 +30,7 @@ const NEWSTYLE_CVCT_COMPRESSED: usize = 0x08;
 
 /// A parsed entry from the VISE file table
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Entry {
     Dir(String),
     File(FileEntry),
@@ -47,6 +48,7 @@ impl Entry {
 
 /// Metadata and location info for a single archived file
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct FileEntry {
     pub name: String,
     pub file_type: [u8; 4],
@@ -70,10 +72,17 @@ impl FileEntry {
     pub const fn is_stub(&self) -> bool {
         (self.flags & 0x0800_0000) != 0
     }
+
+    /// Whether the entry has a resource fork stored in the archive
+    #[must_use]
+    pub const fn has_rsrc(&self) -> bool {
+        self.comp_rsrc > 0 && self.uncomp_rsrc > 0
+    }
 }
 
 /// Top-level archive metadata produced by parsing
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ArchiveInfo {
     pub entries: Vec<Entry>,
     pub num_segments: usize,
@@ -97,27 +106,23 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
     let num_segments = read_u32(data, 0x14)? as usize;
 
     let cvct = read_u32(data, 0x24)? as usize;
-    if data.len() < cvct + 4 || &data[cvct..cvct + 4] != b"CVCT" {
-        return Err(Error::InvalidArchive(format!("missing CVCT at 0x{cvct:x}")));
-    }
+    // everything from the CVCT tag on; all offsets below are relative to it,
+    // so a pointer near the top of the address space cannot overflow
+    let table = data
+        .get(cvct..)
+        .filter(|t| t.starts_with(b"CVCT"))
+        .ok_or_else(|| Error::InvalidArchive(format!("missing CVCT at 0x{cvct:x}")))?;
 
     let (body_start, decompressed_body);
-    if data.len() >= cvct + NEWSTYLE_CVCT_BODY && &data[cvct + 0x14..cvct + 0x18] == b"PACK" {
-        if read_u32(data, cvct + NEWSTYLE_CVCT_COMPRESSED)? != 0 {
-            let body_size = read_u32(data, cvct + 4)? as usize;
-            let comp_start = cvct + NEWSTYLE_CVCT_BODY;
-            let comp_end = comp_start + body_size;
-            if comp_end > data.len() {
-                return Err(Error::InvalidArchive(
-                    "compressed CVCT body extends past archive end".into(),
-                ));
-            }
-            decompressed_body =
-                deflate::decompress_raw_word_deflate(&data[comp_start..comp_end], 0)?;
-            eprintln!(
-                "  decompressed CVCT body ({body_size} -> {} bytes)",
-                decompressed_body.len()
-            );
+    if table.len() >= NEWSTYLE_CVCT_BODY && &table[0x14..0x18] == b"PACK" {
+        if read_u32(table, NEWSTYLE_CVCT_COMPRESSED)? != 0 {
+            let body_size = read_u32(table, 4)? as usize;
+            let compressed = table[NEWSTYLE_CVCT_BODY..]
+                .get(..body_size)
+                .ok_or_else(|| {
+                    Error::InvalidArchive("compressed CVCT body extends past archive end".into())
+                })?;
+            decompressed_body = deflate::decompress_raw_word_deflate(compressed, 0)?;
             body_start = 0;
         } else {
             decompressed_body = Vec::new();
@@ -155,15 +160,10 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
             let flags = read_u32(parse_data, pos + FVCT_FLAGS)?;
             let segment = read_u16(parse_data, pos + FVCT_SEGMENT)?;
 
-            let mut ft = [0u8; 4];
-            ft.copy_from_slice(&parse_data[pos + FVCT_TYPE..pos + FVCT_TYPE + 4]);
-            let mut cr = [0u8; 4];
-            cr.copy_from_slice(&parse_data[pos + FVCT_CREATOR..pos + FVCT_CREATOR + 4]);
-
             entries.push(Entry::File(FileEntry {
                 name,
-                file_type: ft,
-                creator: cr,
+                file_type: read_array(parse_data, pos + FVCT_TYPE)?,
+                creator: read_array(parse_data, pos + FVCT_CREATOR)?,
                 flags,
                 segment,
                 comp_data: read_u32(parse_data, pos + FVCT_COMP_DATA)? as usize,
@@ -281,18 +281,19 @@ fn infer_name_off(
         .map_or(nlen_off + 2, |(off, _)| off)
 }
 
+fn read_array<const N: usize>(data: &[u8], off: usize) -> Result<[u8; N], Error> {
+    off.checked_add(N)
+        .and_then(|end| data.get(off..end))
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| Error::InvalidArchive(format!("truncated at 0x{off:x}")))
+}
+
 fn read_u16(data: &[u8], off: usize) -> Result<u16, Error> {
-    let bytes = data
-        .get(off..off + 2)
-        .ok_or_else(|| Error::InvalidArchive(format!("truncated at 0x{off:x}")))?;
-    Ok(u16::from_be_bytes(bytes.try_into().unwrap()))
+    read_array(data, off).map(u16::from_be_bytes)
 }
 
 fn read_u32(data: &[u8], off: usize) -> Result<u32, Error> {
-    let bytes = data
-        .get(off..off + 4)
-        .ok_or_else(|| Error::InvalidArchive(format!("truncated at 0x{off:x}")))?;
-    Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
+    read_array(data, off).map(u32::from_be_bytes)
 }
 
 /// Mac Roman (bytes 0x80-0xFF) to Unicode
@@ -340,6 +341,57 @@ fn mac_str(data: &[u8], off: usize, len: usize) -> String {
         .iter()
         .map(|&b| mac_roman_char(b))
         .collect()
+}
+
+/// Record builders for tests that assemble whole archives
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::{
+        DVCT_NLEN, FVCT_BLOCK_DATA_OFF, FVCT_BLOCK_RSRC_OFF, FVCT_COMP_DATA, FVCT_COMP_RSRC,
+        FVCT_DATA_OFFSET, FVCT_FLAGS, FVCT_NLEN, FVCT_SEGMENT, FVCT_UNCOMP_DATA, FVCT_UNCOMP_RSRC,
+    };
+
+    #[derive(Default)]
+    pub(crate) struct TestFile {
+        pub name: &'static str,
+        pub flags: u32,
+        pub segment: u16,
+        pub data_offset: u32,
+        pub comp_data: u32,
+        pub uncomp_data: u32,
+        pub comp_rsrc: u32,
+        pub uncomp_rsrc: u32,
+        pub block_data_off: u32,
+        pub block_rsrc_off: u32,
+    }
+
+    /// An FVCT record with the name as its last field, two bytes after the
+    /// length byte, which is where the parser looks by default
+    pub(crate) fn fvct_record(f: &TestFile) -> Vec<u8> {
+        let mut r = vec![0u8; FVCT_NLEN + 2];
+        r[..4].copy_from_slice(b"FVCT");
+        let mut put = |off: usize, v: u32| r[off..off + 4].copy_from_slice(&v.to_be_bytes());
+        put(FVCT_FLAGS, f.flags);
+        put(FVCT_COMP_DATA, f.comp_data);
+        put(FVCT_UNCOMP_DATA, f.uncomp_data);
+        put(FVCT_COMP_RSRC, f.comp_rsrc);
+        put(FVCT_UNCOMP_RSRC, f.uncomp_rsrc);
+        put(FVCT_DATA_OFFSET, f.data_offset);
+        put(FVCT_BLOCK_DATA_OFF, f.block_data_off);
+        put(FVCT_BLOCK_RSRC_OFF, f.block_rsrc_off);
+        r[FVCT_SEGMENT..FVCT_SEGMENT + 2].copy_from_slice(&f.segment.to_be_bytes());
+        r[FVCT_NLEN] = u8::try_from(f.name.len()).unwrap();
+        r.extend_from_slice(f.name.as_bytes());
+        r
+    }
+
+    pub(crate) fn dvct_record(name: &str) -> Vec<u8> {
+        let mut r = vec![0u8; DVCT_NLEN + 2];
+        r[..4].copy_from_slice(b"DVCT");
+        r[DVCT_NLEN] = u8::try_from(name.len()).unwrap();
+        r.extend_from_slice(name.as_bytes());
+        r
+    }
 }
 
 #[cfg(test)]

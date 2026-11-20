@@ -53,6 +53,27 @@ Extracting to output/
 Done: 12 extracted, 0 skipped, 0 failed
 ```
 
+## Library
+
+```toml
+[dependencies]
+unvise = "0.3"
+```
+
+```rust
+let raw = std::fs::read("Installer")?;
+if let unvise::InputKind::Mac(data) = unvise::detect_format(raw) {
+    let archive = unvise::Archive::parse(data)?;
+    let mut reader = archive.reader();
+    for file in archive.files() {
+        let forks = reader.read(file)?;
+        println!("{}: {} + {} bytes", file.name, forks.data.len(), forks.rsrc.len());
+    }
+}
+```
+
+`Archive::reader` reads entries into memory. `Archive::extract` writes everything to a directory, and `Archive::extract_with` does the same while reporting each entry through a callback. Windows installers use `WinArchive::from_pe` with `WinArchive::read`, `extract` and `extract_with`. The library prints nothing itself
+
 ## Source layout
 
 ```
@@ -113,14 +134,21 @@ File data is stored as DEFLATE with a byte-pair swap applied to the compressed s
 
 ### Multi-segment installers
 
-Some installers span multiple files. On Mac, segment files are discovered automatically in the same directory as the main archive and concatenated by sequence number. On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
+Some installers span multiple files. On Mac, segment files are discovered automatically in the same directory as the main archive and concatenated by sequence number. File offsets count through the segments in order, so segments are used as an unbroken run from 2 upward; one that follows a gap is ignored with a warning. On Windows, stub installers store the record stream in the `.exe` and file data in a companion `.qdat`; place the `.qdat` in the same directory as the `.exe` and it will be discovered
 
 ## Testing
 
-Unit tests cover the decompression pipeline, parser, and safety checks:
+Unit tests cover the decompression pipeline, parser, and safety checks, and build small archives in memory to test extraction end to end:
 
 ```sh
 cargo test
+```
+
+CI also runs the formatter and linter:
+
+```sh
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Acknowledgements

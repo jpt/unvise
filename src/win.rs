@@ -10,22 +10,20 @@
 //! Four runtime versions exist, each with slightly different record layouts.
 //! Detection is based on the embedded DLL's PE export count, an internal
 //! ASCII version table, and the presence of the `vise32qt` string. See
-//! [`RecordFmt`] for details
+//! `RecordFmt` for details
 //!
 //! Compression is byte-pair swap + raw DEFLATE (no substitution cipher,
 //! unlike the Mac format). Stub installers store the record stream in the
 //! `.exe` and file data in a companion `.qdat` volume matched by session ID
 
 use std::fs;
-use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 
-use crate::{Error, ExtractResult, clean_name, safe_join};
-
-/// DEFLATE maximum expansion ratio (258 bytes from 2 bits = 1032:1)
-const OUTPUT_BUDGET_RATIO: usize = 1032;
-/// Minimum output budget so tiny archives still extract
-const OUTPUT_BUDGET_HEADROOM: usize = 1 << 20;
+use crate::{
+    Error, ExtractResult, OUTPUT_BUDGET_HEADROOM, OUTPUT_BUDGET_RATIO, Progress, SkipReason,
+    clean_name, safe_join,
+};
 
 /// SIVM payloads store blob offsets relative to payload byte 8 (after the
 /// SIVM magic and trailer-offset fields)
@@ -46,6 +44,8 @@ const QDAT_MAGIC: &[u8; 8] = b"ESIVRDLB";
 /// + 4-byte count + 782 bytes of metadata)
 const QDAT_ENTRIES_OFFSET: usize = 802;
 const QDAT_ENTRY_HEADER: usize = 16;
+/// String found only in the Apple fork of the runtime DLL
+const APPLE_MARKER: &[u8] = b"vise32qt";
 
 /// Record format version, detected from three properties of the embedded
 /// vise32ex.dll: PE export count, ASCII version table contents, and the
@@ -78,14 +78,18 @@ enum PayloadKind {
     Esiv,
 }
 
+/// A loaded Windows VISE installer ready for extraction
 #[derive(Debug)]
 pub struct WinArchive {
     data: Vec<u8>,
+    /// Where the VISE payload sits inside `data`
+    payload: Range<usize>,
     qdat: Option<Vec<u8>>,
     pub info: WinArchiveInfo,
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WinArchiveInfo {
     pub version: u32,
     pub flags: u32,
@@ -93,16 +97,50 @@ pub struct WinArchiveInfo {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct WinEntry {
     pub name: String,
     pub directory: String,
     pub offset: usize,
     pub compressed_len: usize,
+    /// Size recorded in the file table, or 0 when the table does not give one
     pub uncompressed_len: usize,
     use_qdat: bool,
 }
 
+impl WinEntry {
+    /// The install path relative to the output directory: `directory/name`
+    #[must_use]
+    pub fn path(&self) -> String {
+        if self.directory.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}/{}", self.directory, self.name)
+        }
+    }
+}
+
 impl WinArchive {
+    /// Parses an installer executable, locating the VISE payload inside it.
+    /// `qdat` is the companion volume of a stub installer, if there is one
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArchive`] if the file is not a PE executable
+    /// carrying a VISE payload, or the record stream cannot be parsed
+    pub fn from_pe(file: Vec<u8>, qdat: Option<Vec<u8>>) -> Result<Self, Error> {
+        let (payload, start) = crate::pe::extract_payload(&file)?;
+        let range = start..start + payload.len();
+        let info = parse_payload(payload, qdat.as_deref(), start)?;
+        Ok(Self {
+            data: file,
+            payload: range,
+            qdat,
+            info,
+        })
+    }
+
+    /// Parses a payload already cut out of its executable.
     /// `payload_file_offset` is the byte position of the payload within the
     /// PE file, needed because Pre4 blob offsets are file-relative
     ///
@@ -116,7 +154,16 @@ impl WinArchive {
         payload_file_offset: usize,
     ) -> Result<Self, Error> {
         let info = parse_payload(&data, qdat.as_deref(), payload_file_offset)?;
-        Ok(Self { data, qdat, info })
+        Ok(Self {
+            payload: 0..data.len(),
+            data,
+            qdat,
+            info,
+        })
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.data[self.payload.clone()]
     }
 
     /// Session ID from a SIVM (offset 0x0C) or ESIV (offset 0x04) header
@@ -156,36 +203,92 @@ impl WinArchive {
             && u32::from_le_bytes(qdat[0x0C..0x10].try_into().unwrap_or([0; 4])) == expected_session
     }
 
+    /// Decompresses one entry into memory
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Skipped`] if the entry's data is in a companion
+    /// `.qdat` volume that was not supplied, or [`Error::Decompression`] if
+    /// the data is out of range, does not decode, or does not match the size
+    /// recorded in the file table
+    pub fn read(&self, entry: &WinEntry) -> Result<Vec<u8>, Error> {
+        if entry.compressed_len == 0 {
+            return Ok(Vec::new());
+        }
+        let source = if entry.use_qdat {
+            self.qdat
+                .as_deref()
+                .ok_or(Error::Skipped(SkipReason::MissingQdat))?
+        } else {
+            self.payload()
+        };
+        let blob = entry
+            .offset
+            .checked_add(entry.compressed_len)
+            .and_then(|end| source.get(entry.offset..end))
+            .ok_or_else(|| Error::Decompression("offset out of range".into()))?;
+        let out = crate::deflate::swap_and_inflate(blob)
+            .ok_or_else(|| Error::Decompression("invalid compressed data".into()))?;
+        if entry.uncompressed_len != 0 && out.len() != entry.uncompressed_len {
+            return Err(Error::Decompression(format!(
+                "decoded {} bytes, file table says {}",
+                out.len(),
+                entry.uncompressed_len
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Extracts all files to `out_dir`, recreating the install directory
+    /// structure
+    ///
+    /// Entries that cannot be decoded are counted in
+    /// [`ExtractResult::failed`] and extraction continues
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Io`] on filesystem failures
     pub fn extract(&self, out_dir: &Path) -> Result<ExtractResult, Error> {
+        self.extract_with(out_dir, |_| {})
+    }
+
+    /// Like [`WinArchive::extract`], and reports each entry to `on_progress`
+    /// as it is handled
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] on filesystem failures
+    pub fn extract_with(
+        &self,
+        out_dir: &Path,
+        mut on_progress: impl FnMut(Progress<'_>),
+    ) -> Result<ExtractResult, Error> {
         fs::create_dir_all(out_dir)?;
 
         let budget = self
-            .data
+            .payload
             .len()
+            .saturating_add(self.qdat.as_ref().map_or(0, Vec::len))
             .saturating_mul(OUTPUT_BUDGET_RATIO)
             .saturating_add(OUTPUT_BUDGET_HEADROOM);
         let mut total_out: usize = 0;
-        let mut result = ExtractResult {
-            extracted: 0,
-            skipped: 0,
-            failed: 0,
-        };
+        let mut result = ExtractResult::default();
 
         for entry in &self.info.entries {
-            let rel_path = if entry.directory.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", entry.directory, entry.name)
-            };
-            let name = clean_name(&rel_path);
+            let name = clean_name(&entry.path());
             if name.is_empty() {
+                on_progress(Progress::Skipped {
+                    name: &name,
+                    reason: SkipReason::EmptyName,
+                });
                 result.skipped += 1;
                 continue;
             }
             let Some(path) = safe_join(out_dir, &name) else {
+                on_progress(Progress::Skipped {
+                    name: &name,
+                    reason: SkipReason::UnsafePath,
+                });
                 result.skipped += 1;
                 continue;
             };
@@ -193,49 +296,35 @@ impl WinArchive {
                 fs::create_dir_all(p)?;
             }
 
-            if entry.compressed_len == 0 {
-                fs::File::create(&path)?;
-                eprintln!("  {name} (0 bytes)");
-                result.extracted += 1;
-                continue;
-            }
-
-            let source = if entry.use_qdat {
-                self.qdat.as_deref()
-            } else {
-                Some(self.data.as_slice())
-            };
-            let Some(source) = source else {
-                eprintln!("  SKIP {name}: companion .qdat not available");
-                result.skipped += 1;
-                continue;
-            };
-
-            let blob_start = entry.offset;
-            let Some(blob_end) = blob_start.checked_add(entry.compressed_len) else {
-                result.failed += 1;
-                continue;
-            };
-            if blob_end > source.len() {
-                eprintln!("  FAIL {name}: offset out of range");
-                result.failed += 1;
-                continue;
-            }
-
-            if let Some(decompressed) =
-                crate::deflate::swap_and_inflate(&source[blob_start..blob_end])
-            {
-                fs::File::create(&path)?.write_all(&decompressed)?;
-                eprintln!("  {name} ({} bytes)", decompressed.len());
-                result.extracted += 1;
-                total_out = total_out.saturating_add(decompressed.len());
-                if total_out > budget {
-                    eprintln!("  aborting: output exceeds {budget} byte budget");
-                    break;
+            match self.read(entry) {
+                Ok(bytes) => {
+                    fs::write(&path, &bytes)?;
+                    on_progress(Progress::Extracted {
+                        name: &name,
+                        data_len: bytes.len(),
+                        rsrc_len: None,
+                    });
+                    result.extracted += 1;
+                    total_out = total_out.saturating_add(bytes.len());
+                    if total_out > budget {
+                        on_progress(Progress::BudgetExceeded { budget });
+                        break;
+                    }
                 }
-            } else {
-                eprintln!("  FAIL {name}");
-                result.failed += 1;
+                Err(Error::Skipped(reason)) => {
+                    on_progress(Progress::Skipped {
+                        name: &name,
+                        reason,
+                    });
+                    result.skipped += 1;
+                }
+                Err(error) => {
+                    on_progress(Progress::Failed {
+                        name: &name,
+                        error: &error,
+                    });
+                    result.failed += 1;
+                }
             }
         }
 
@@ -380,14 +469,15 @@ fn walk_named_chain(
             u32::from_le_bytes(data[size_off..size_off + 4].try_into().unwrap()) as usize;
 
         let body_off = size_off + 4;
-        if comp_size == 0 || body_off + comp_size > data.len() {
+        let Some(body_end) = body_off
+            .checked_add(comp_size)
+            .filter(|&end| comp_size != 0 && end <= data.len())
+        else {
             break;
-        }
+        };
 
         if name == "vise32ex.dll" {
-            if let Some(dll) =
-                crate::deflate::swap_and_inflate(&data[body_off..body_off + comp_size])
-            {
+            if let Some(dll) = crate::deflate::swap_and_inflate(&data[body_off..body_end]) {
                 rec_fmt = detect_record_fmt(&dll);
             }
         }
@@ -400,7 +490,7 @@ fn walk_named_chain(
             uncompressed_len: 0,
             use_qdat: false,
         });
-        pos = body_off + comp_size;
+        pos = body_end;
     }
     (pos, rec_fmt)
 }
@@ -420,7 +510,7 @@ fn detect_record_fmt(dll: &[u8]) -> RecordFmt {
         }
         return RecordFmt::Main4;
     }
-    if dll.windows(9).any(|w| w == b"vise32qt") {
+    if dll.windows(APPLE_MARKER.len()).any(|w| w == APPLE_MARKER) {
         return RecordFmt::Apple;
     }
     RecordFmt::Pre4
@@ -456,7 +546,7 @@ fn find_runtime_version(dll: &[u8]) -> Option<(u32, u32)> {
 /// opens the record stream, validating by parsing the first record's
 /// common header
 fn find_record_stream(data: &[u8], chain_end: usize, fmt: RecordFmt) -> Result<usize, Error> {
-    let search_end = data.len().min(chain_end + 0x40000);
+    let search_end = data.len().min(chain_end.saturating_add(0x40000));
     for off in chain_end..search_end {
         if off + 8 > data.len() {
             break;
@@ -842,7 +932,7 @@ fn read_type2(c: &mut Cursor, blob_add: usize, blob_sub: usize) -> Result<WinEnt
         .trim_matches('/')
         .to_string();
 
-    let offset = (blob_off + blob_add).saturating_sub(blob_sub);
+    let offset = blob_off.saturating_add(blob_add).saturating_sub(blob_sub);
 
     Ok(WinEntry {
         name,
@@ -944,6 +1034,72 @@ mod tests {
     use super::*;
     use crate::safe_join;
     use std::path::Path;
+
+    #[test]
+    fn detects_each_runtime_from_its_dll() {
+        assert_eq!(
+            detect_record_fmt(b"..\x00vise32qt.dll\x00.."),
+            RecordFmt::Apple
+        );
+        assert_eq!(detect_record_fmt(b"..\x004.7.0.2\x00.."), RecordFmt::Main4);
+        assert_eq!(detect_record_fmt(b"..\x004.9.0.0\x00.."), RecordFmt::Main48);
+        assert_eq!(detect_record_fmt(b"no markers here"), RecordFmt::Pre4);
+    }
+
+    #[test]
+    fn read_checks_range_size_and_qdat() {
+        // "stored size" 5 bytes: a raw DEFLATE stream for b"hello", byte-pair swapped
+        let mut comp = flate2::Compress::new(flate2::Compression::best(), false);
+        let mut blob = vec![0u8; 64];
+        comp.compress(b"hello", &mut blob, flate2::FlushCompress::Finish)
+            .unwrap();
+        blob.truncate(usize::try_from(comp.total_out()).unwrap());
+        for pair in blob.chunks_exact_mut(2) {
+            pair.swap(0, 1);
+        }
+
+        let entry = |offset, compressed_len, uncompressed_len, use_qdat| WinEntry {
+            name: "f".into(),
+            directory: String::new(),
+            offset,
+            compressed_len,
+            uncompressed_len,
+            use_qdat,
+        };
+        let archive = WinArchive {
+            payload: 0..blob.len(),
+            data: blob.clone(),
+            qdat: None,
+            info: WinArchiveInfo {
+                version: 0,
+                flags: 0,
+                entries: Vec::new(),
+            },
+        };
+
+        assert_eq!(
+            archive.read(&entry(0, blob.len(), 5, false)).unwrap(),
+            b"hello"
+        );
+        // size unknown (0) is accepted; a wrong size is an error
+        assert_eq!(
+            archive.read(&entry(0, blob.len(), 0, false)).unwrap(),
+            b"hello"
+        );
+        assert!(matches!(
+            archive.read(&entry(0, blob.len(), 6, false)),
+            Err(Error::Decompression(_))
+        ));
+        assert!(matches!(
+            archive.read(&entry(1, blob.len(), 5, false)),
+            Err(Error::Decompression(_))
+        ));
+        assert!(matches!(
+            archive.read(&entry(0, blob.len(), 5, true)),
+            Err(Error::Skipped(SkipReason::MissingQdat))
+        ));
+        assert_eq!(archive.read(&entry(0, 0, 0, false)).unwrap(), b"");
+    }
 
     #[test]
     fn rejects_non_vise() {
