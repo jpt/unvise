@@ -1,38 +1,60 @@
 //! VISE archive file table parser
 //!
-//! Parses the SVCT/CVCT/DVCT/FVCT chunk structure present in all observed
-//! VISE versions from 00 01 through 03 0e. The parser scans for tags rather
-//! than relying on fixed offsets, and infers per-version name field positions
-//! dynamically from tag stride patterns
+//! Parses the SVCT/CVCT/DVCT/FVCT chunk structure of format versions 00 01
+//! through 03 0e and 0b 00. The parser scans for tags instead of relying on
+//! fixed offsets, and works out where each version keeps its name fields
+//! from the spacing of the tags
 
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use crate::text::NameEncoding;
 use crate::{Error, deflate};
 
 const FVCT_FLAGS: usize = 12;
 const FVCT_TYPE: usize = 44;
 const FVCT_CREATOR: usize = 48;
+const FVCT_FINDER_FLAGS: usize = 52;
+const FVCT_CREATED: usize = 60;
+const FVCT_MODIFIED: usize = 64;
 const FVCT_COMP_DATA: usize = 68;
 const FVCT_UNCOMP_DATA: usize = 72;
 const FVCT_COMP_RSRC: usize = 76;
 const FVCT_UNCOMP_RSRC: usize = 80;
+const FVCT_CRC: usize = 84;
+const FVCT_DEPTH: usize = 96;
 const FVCT_SEGMENT: usize = 98;
 const FVCT_DATA_OFFSET: usize = 100;
 const FVCT_BLOCK_DATA_OFF: usize = 104;
 const FVCT_BLOCK_RSRC_OFF: usize = 108;
 const FVCT_NLEN: usize = 122;
-const FVCT_MIN_RECORD: usize = FVCT_NLEN + 1;
+const DVCT_DEPTH: usize = 72;
 const DVCT_NLEN: usize = 80;
-const DVCT_MIN_RECORD: usize = DVCT_NLEN + 1;
+/// First format version used by the Mac OS X installers, which keep the
+/// table and the data in separate files inside the application bundle
+pub(crate) const FMT_OSX: u8 = 0x0b;
+/// Deepest folder nesting kept. Real installers stay far below this; the cap
+/// bounds the path built for each record of a crafted table
+const MAX_DIR_DEPTH: usize = 64;
+/// Folder paths may add up to this many times the size of the file table
+const PATH_BUDGET_RATIO: usize = 64;
 
 /// v3.06+ CVCT uses a 100-byte header with chunk-type offsets before the body
 const NEWSTYLE_CVCT_BODY: usize = 0x64;
 /// When non-zero, the CVCT body is compressed with word-aligned DEFLATE (no cipher)
 const NEWSTYLE_CVCT_COMPRESSED: usize = 0x08;
 
+/// Separator between folder names in [`Entry::Dir`] and [`FileEntry::dir`].
+/// A colon cannot appear in a Mac file name, so the joined path is unambiguous
+pub const PATH_SEPARATOR: char = ':';
+
 /// A parsed entry from the VISE file table
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Entry {
-    Dir(String),
+    /// A folder, as its full path from the install root: the names of its
+    /// parent folders and its own name, joined with [`PATH_SEPARATOR`]
+    Dir(Arc<str>),
     File(FileEntry),
 }
 
@@ -50,10 +72,25 @@ impl Entry {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct FileEntry {
+    /// The file name, decoded with the encoding the archive was parsed with
     pub name: String,
+    /// The file name as the archive stores it, in the Mac text encoding of
+    /// the system the installer was built on
+    pub name_bytes: Vec<u8>,
+    /// Path of the folder holding the file, as folder names joined with
+    /// [`PATH_SEPARATOR`]. Empty for a file at the install root
+    pub dir: Arc<str>,
     pub file_type: [u8; 4],
     pub creator: [u8; 4],
     pub flags: u32,
+    /// Finder flags (`fdFlags`), such as the invisible and custom-icon bits
+    pub finder_flags: u16,
+    /// Creation time, in seconds since 1904-01-01 local time
+    pub created: u32,
+    /// Modification time, in seconds since 1904-01-01 local time
+    pub modified: u32,
+    /// CRC-32 of the data fork followed by the resource fork
+    pub crc32: u32,
     pub segment: u16,
     pub comp_data: usize,
     pub uncomp_data: usize,
@@ -78,6 +115,45 @@ impl FileEntry {
     pub const fn has_rsrc(&self) -> bool {
         self.comp_rsrc > 0 && self.uncomp_rsrc > 0
     }
+
+    /// The modification time as a system time, or `None` if none is recorded.
+    /// Mac timestamps carry no time zone; they are read as UTC
+    #[must_use]
+    pub fn modified_time(&self) -> Option<SystemTime> {
+        mac_time(self.modified)
+    }
+
+    /// The creation time, read the same way as [`FileEntry::modified_time`]
+    #[must_use]
+    pub fn created_time(&self) -> Option<SystemTime> {
+        mac_time(self.created)
+    }
+
+    /// The 32 bytes of Finder information for the file: type, creator and
+    /// Finder flags, with the fields the archive does not record left zero
+    #[must_use]
+    pub fn finder_info(&self) -> [u8; 32] {
+        let mut info = [0u8; 32];
+        info[..4].copy_from_slice(&self.file_type);
+        info[4..8].copy_from_slice(&self.creator);
+        info[8..10].copy_from_slice(&self.finder_flags.to_be_bytes());
+        info
+    }
+}
+
+/// Seconds between the Mac epoch (1904-01-01) and the Unix epoch
+const MAC_EPOCH_OFFSET: u64 = 2_082_844_800;
+
+fn mac_time(secs: u32) -> Option<SystemTime> {
+    if secs == 0 {
+        return None;
+    }
+    let secs = u64::from(secs);
+    if secs >= MAC_EPOCH_OFFSET {
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs - MAC_EPOCH_OFFSET))
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(MAC_EPOCH_OFFSET - secs))
+    }
 }
 
 /// Top-level archive metadata produced by parsing
@@ -96,7 +172,7 @@ pub struct ArchiveInfo {
 ///
 /// Returns [`Error::InvalidArchive`] if the data lacks an SVCT header or
 /// the CVCT pointer is invalid
-pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
+pub fn parse(data: &[u8], encoding: NameEncoding) -> Result<ArchiveInfo, Error> {
     if data.len() < 0x28 || &data[..4] != b"SVCT" {
         return Err(Error::InvalidArchive("missing SVCT header".into()));
     }
@@ -139,47 +215,54 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         &decompressed_body
     };
     let tags = scan_tags(parse_data, body_start);
-    let fvct_name_off = infer_name_off(parse_data, &tags, TagKind::Fvct, FVCT_NLEN);
-    let dvct_name_off = infer_name_off(parse_data, &tags, TagKind::Dvct, DVCT_NLEN);
+    // From format 0b (the Mac OS X installers) both record kinds have two
+    // more bytes of fields before the name length
+    let later = if fmt_major >= FMT_OSX { 2 } else { 0 };
+    let (fvct_nlen, dvct_nlen) = (FVCT_NLEN + later, DVCT_NLEN + later);
+    let fvct_name_off = infer_name_off(parse_data, &tags, TagKind::Fvct, fvct_nlen);
+    let dvct_name_off = infer_name_off(parse_data, &tags, TagKind::Dvct, dvct_nlen);
 
     let mut entries = Vec::with_capacity(tags.len());
-    let mut current_dir = String::new();
+    // names of the folders enclosing the current record, outermost first.
+    // Every record stores how deep it sits, so a folder at depth `d` replaces
+    // whatever was open at that depth and below
+    let mut open_dirs: Vec<String> = Vec::new();
+    // paths[n] is the path of the first n open folders
+    let mut paths: Vec<Arc<str>> = vec![Arc::from("")];
+    let mut path_budget = parse_data.len().saturating_mul(PATH_BUDGET_RATIO);
 
     for &(pos, kind) in &tags {
         if kind == TagKind::Fvct {
-            if pos + FVCT_MIN_RECORD > parse_data.len() {
+            if pos + fvct_nlen + 1 > parse_data.len() {
                 continue;
             }
-            let nlen = usize::from(parse_data[pos + FVCT_NLEN]);
-            let name = if pos + fvct_name_off + nlen <= parse_data.len() {
-                mac_str(parse_data, pos + fvct_name_off, nlen)
+            let depth = usize::from(read_u16(parse_data, pos + FVCT_DEPTH)?);
+            // shared with every other file in the folder
+            let dir = Arc::clone(&paths[depth.min(open_dirs.len())]);
+            let name_at = (pos + fvct_nlen, pos + fvct_name_off);
+            entries.push(Entry::File(file_entry(
+                parse_data, pos, name_at, encoding, dir,
+            )?));
+        } else if kind == TagKind::Dvct && pos + dvct_nlen < parse_data.len() {
+            let nlen = usize::from(parse_data[pos + dvct_nlen]);
+            let name = if pos + dvct_name_off + nlen <= parse_data.len() {
+                mac_str(parse_data, pos + dvct_name_off, nlen, encoding)
             } else {
                 String::new()
             };
-
-            let flags = read_u32(parse_data, pos + FVCT_FLAGS)?;
-            let segment = read_u16(parse_data, pos + FVCT_SEGMENT)?;
-
-            entries.push(Entry::File(FileEntry {
-                name,
-                file_type: read_array(parse_data, pos + FVCT_TYPE)?,
-                creator: read_array(parse_data, pos + FVCT_CREATOR)?,
-                flags,
-                segment,
-                comp_data: read_u32(parse_data, pos + FVCT_COMP_DATA)? as usize,
-                uncomp_data: read_u32(parse_data, pos + FVCT_UNCOMP_DATA)? as usize,
-                comp_rsrc: read_u32(parse_data, pos + FVCT_COMP_RSRC)? as usize,
-                uncomp_rsrc: read_u32(parse_data, pos + FVCT_UNCOMP_RSRC)? as usize,
-                data_offset: read_u32(parse_data, pos + FVCT_DATA_OFFSET)? as usize,
-                block_data_off: read_u32(parse_data, pos + FVCT_BLOCK_DATA_OFF)? as usize,
-                block_rsrc_off: read_u32(parse_data, pos + FVCT_BLOCK_RSRC_OFF)? as usize,
-            }));
-        } else if kind == TagKind::Dvct && pos + DVCT_MIN_RECORD <= parse_data.len() {
-            let nlen = usize::from(parse_data[pos + DVCT_NLEN]);
-            if pos + dvct_name_off + nlen <= parse_data.len() {
-                current_dir = mac_str(parse_data, pos + dvct_name_off, nlen);
-            }
-            entries.push(Entry::Dir(current_dir.clone()));
+            let depth = usize::from(read_u16(parse_data, pos + DVCT_DEPTH)?);
+            open_dirs.truncate(depth.min(MAX_DIR_DEPTH - 1));
+            open_dirs.push(name);
+            let path: Arc<str> = Arc::from(join_dirs(&open_dirs));
+            // every folder record costs a path of its own. Deep nesting of
+            // long names repeated through a table would otherwise take far
+            // more memory than the table
+            path_budget = path_budget.checked_sub(path.len()).ok_or_else(|| {
+                Error::InvalidArchive("folder paths are too long for the size of the table".into())
+            })?;
+            paths.truncate(open_dirs.len());
+            paths.push(Arc::clone(&path));
+            entries.push(Entry::Dir(path));
         }
     }
 
@@ -189,6 +272,64 @@ pub fn parse(data: &[u8]) -> Result<ArchiveInfo, Error> {
         fmt_major,
         fmt_minor,
     })
+}
+
+/// Builds the entry for the file record at `pos`. `name_at` is where its
+/// name length and its name are
+fn file_entry(
+    parse_data: &[u8],
+    pos: usize,
+    (nlen_at, name_off): (usize, usize),
+    encoding: NameEncoding,
+    dir: Arc<str>,
+) -> Result<FileEntry, Error> {
+    let nlen = usize::from(parse_data[nlen_at]);
+    let name_bytes = if name_off + nlen <= parse_data.len() {
+        stored_name(parse_data, name_off, nlen)
+    } else {
+        &[]
+    };
+    let name = encoding.decode(name_bytes);
+    let name_bytes = name_bytes.to_vec();
+
+    let flags = read_u32(parse_data, pos + FVCT_FLAGS)?;
+    let segment = read_u16(parse_data, pos + FVCT_SEGMENT)?;
+
+    Ok(FileEntry {
+        name,
+        name_bytes,
+        dir,
+        file_type: read_array(parse_data, pos + FVCT_TYPE)?,
+        creator: read_array(parse_data, pos + FVCT_CREATOR)?,
+        flags,
+        finder_flags: read_u16(parse_data, pos + FVCT_FINDER_FLAGS)?,
+        created: read_u32(parse_data, pos + FVCT_CREATED)?,
+        modified: read_u32(parse_data, pos + FVCT_MODIFIED)?,
+        crc32: read_u32(parse_data, pos + FVCT_CRC)?,
+        segment,
+        comp_data: read_u32(parse_data, pos + FVCT_COMP_DATA)? as usize,
+        uncomp_data: read_u32(parse_data, pos + FVCT_UNCOMP_DATA)? as usize,
+        comp_rsrc: read_u32(parse_data, pos + FVCT_COMP_RSRC)? as usize,
+        uncomp_rsrc: read_u32(parse_data, pos + FVCT_UNCOMP_RSRC)? as usize,
+        data_offset: read_u32(parse_data, pos + FVCT_DATA_OFFSET)? as usize,
+        block_data_off: read_u32(parse_data, pos + FVCT_BLOCK_DATA_OFF)? as usize,
+        block_rsrc_off: read_u32(parse_data, pos + FVCT_BLOCK_RSRC_OFF)? as usize,
+    })
+}
+
+fn join_dirs(dirs: &[String]) -> String {
+    let mut out = String::new();
+    for name in dirs {
+        if !out.is_empty() {
+            out.push(PATH_SEPARATOR);
+        }
+        // a colon inside a folder name would read as a separator
+        out.extend(
+            name.chars()
+                .map(|c| if c == PATH_SEPARATOR { '_' } else { c }),
+        );
+    }
+    out
 }
 
 /// Non-directory CVCT record tags, used only for stride inference
@@ -230,24 +371,28 @@ fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, TagKind)> {
 }
 
 /// Infers the name field offset for a tag type by examining stride patterns.
-/// The name is always the last field in a record, so `name_off` = stride - nlen.
-/// When there are multiple consecutive same-type tags, stride voting across
-/// pairs gives a robust answer. For single-record archives (only one tag of a
-/// given type), falls back to using the next tag of any type as a stride bound.
+/// The name is always the last field in a record, so `name_off` = stride - nlen,
+/// where the stride is the distance to the next record. Every record of the
+/// type votes, and the most common answer wins.
 fn infer_name_off(
     data: &[u8],
     tags: &[(usize, TagKind)],
     target: TagKind,
     nlen_off: usize,
 ) -> usize {
-    // Precompute each index's next same-type tag in one reverse pass. A naive
+    // Records sit back to back, so a record ends where the next file or
+    // folder record starts, whichever kind that is. Measuring to the next
+    // record of the same kind instead would count a folder record lying
+    // between two files as part of the first file.
+    //
+    // Precompute each index's next record in one reverse pass. A naive
     // inner search is O(tags^2), which a body densely packed with markers
     // (post-decompression, attacker-influenced) could exploit to stall the parser
-    let mut next_same_pos = vec![None; tags.len()];
+    let mut next_record_pos = vec![None; tags.len()];
     let mut seen: Option<usize> = None;
     for i in (0..tags.len()).rev() {
-        next_same_pos[i] = seen;
-        if tags[i].1 == target {
+        next_record_pos[i] = seen;
+        if tags[i].1 != TagKind::Other {
             seen = Some(tags[i].0);
         }
     }
@@ -259,8 +404,8 @@ fn infer_name_off(
         if kind != target {
             continue;
         }
-        // Prefer stride to next same-type tag; fall back to next tag of any type
-        let stride_to = next_same_pos[i].unwrap_or(tags[i + 1].0);
+        // after the last record, the next tag of any type bounds it
+        let stride_to = next_record_pos[i].unwrap_or(tags[i + 1].0);
         let stride = stride_to - pos;
         if pos + nlen_off >= data.len() {
             continue;
@@ -296,51 +441,17 @@ fn read_u32(data: &[u8], off: usize) -> Result<u32, Error> {
     read_array(data, off).map(u32::from_be_bytes)
 }
 
-/// Mac Roman (bytes 0x80-0xFF) to Unicode
-#[rustfmt::skip]
-const MACROMAN_HIGH: [char; 128] = [
-    '\u{00C4}','\u{00C5}','\u{00C7}','\u{00C9}','\u{00D1}','\u{00D6}','\u{00DC}','\u{00E1}',
-    '\u{00E0}','\u{00E2}','\u{00E4}','\u{00E3}','\u{00E5}','\u{00E7}','\u{00E9}','\u{00E8}',
-    '\u{00EA}','\u{00EB}','\u{00ED}','\u{00EC}','\u{00EE}','\u{00EF}','\u{00F1}','\u{00F3}',
-    '\u{00F2}','\u{00F4}','\u{00F6}','\u{00F5}','\u{00FA}','\u{00F9}','\u{00FB}','\u{00FC}',
-    '\u{2020}','\u{00B0}','\u{00A2}','\u{00A3}','\u{00A7}','\u{2022}','\u{00B6}','\u{00DF}',
-    '\u{00AE}','\u{00A9}','\u{2122}','\u{00B4}','\u{00A8}','\u{2260}','\u{00C6}','\u{00D8}',
-    '\u{221E}','\u{00B1}','\u{2264}','\u{2265}','\u{00A5}','\u{00B5}','\u{2202}','\u{2211}',
-    '\u{220F}','\u{03C0}','\u{222B}','\u{00AA}','\u{00BA}','\u{03A9}','\u{00E6}','\u{00F8}',
-    '\u{00BF}','\u{00A1}','\u{00AC}','\u{221A}','\u{0192}','\u{2248}','\u{2206}','\u{00AB}',
-    '\u{00BB}','\u{2026}','\u{00A0}','\u{00C0}','\u{00C3}','\u{00D5}','\u{0152}','\u{0153}',
-    '\u{2013}','\u{2014}','\u{201C}','\u{201D}','\u{2018}','\u{2019}','\u{00F7}','\u{25CA}',
-    '\u{00FF}','\u{0178}','\u{2044}','\u{20AC}','\u{2039}','\u{203A}','\u{FB01}','\u{FB02}',
-    '\u{2021}','\u{00B7}','\u{201A}','\u{201E}','\u{2030}','\u{00C2}','\u{00CA}','\u{00C1}',
-    '\u{00CB}','\u{00C8}','\u{00CD}','\u{00CE}','\u{00CF}','\u{00CC}','\u{00D3}','\u{00D4}',
-    '\u{F8FF}','\u{00D2}','\u{00DA}','\u{00DB}','\u{00D9}','\u{0131}','\u{02C6}','\u{02DC}',
-    '\u{00AF}','\u{02D8}','\u{02D9}','\u{02DA}','\u{00B8}','\u{02DD}','\u{02DB}','\u{02C7}',
-];
-
-fn mac_roman_char(b: u8) -> char {
-    if b.is_ascii_graphic() || b == b' ' {
-        b as char
-    } else if b >= 0x80 {
-        MACROMAN_HIGH[(b - 0x80) as usize]
-    } else {
-        '?'
-    }
+/// The `len` name bytes at `off` without NUL padding. Spaces are kept: a
+/// Mac name may begin or end with them
+fn stored_name(data: &[u8], off: usize, len: usize) -> &[u8] {
+    let bytes = &data[off..off + len];
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(len);
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(start, |i| i + 1);
+    &bytes[start..end]
 }
 
-fn mac_str(data: &[u8], off: usize, len: usize) -> String {
-    let bytes = &data[off..off + len];
-    let start = bytes
-        .iter()
-        .position(|&b| b != b' ' && b != 0)
-        .unwrap_or(len);
-    let end = bytes
-        .iter()
-        .rposition(|&b| b != b' ' && b != 0)
-        .map_or(start, |i| i + 1);
-    bytes[start..end]
-        .iter()
-        .map(|&b| mac_roman_char(b))
-        .collect()
+fn mac_str(data: &[u8], off: usize, len: usize, encoding: NameEncoding) -> String {
+    encoding.decode(stored_name(data, off, len))
 }
 
 /// Record builders for tests that assemble whole archives
@@ -350,6 +461,30 @@ pub(crate) mod testutil {
         DVCT_NLEN, FVCT_BLOCK_DATA_OFF, FVCT_BLOCK_RSRC_OFF, FVCT_COMP_DATA, FVCT_COMP_RSRC,
         FVCT_DATA_OFFSET, FVCT_FLAGS, FVCT_NLEN, FVCT_SEGMENT, FVCT_UNCOMP_DATA, FVCT_UNCOMP_RSRC,
     };
+
+    /// A file entry with every field empty or zero
+    pub(crate) fn blank_entry() -> super::FileEntry {
+        super::FileEntry {
+            name: String::new(),
+            name_bytes: Vec::new(),
+            dir: std::sync::Arc::from(""),
+            file_type: [0; 4],
+            creator: [0; 4],
+            flags: 0,
+            finder_flags: 0,
+            created: 0,
+            modified: 0,
+            crc32: 0,
+            segment: 0,
+            comp_data: 0,
+            uncomp_data: 0,
+            comp_rsrc: 0,
+            uncomp_rsrc: 0,
+            data_offset: 0,
+            block_data_off: 0,
+            block_rsrc_off: 0,
+        }
+    }
 
     #[derive(Default)]
     pub(crate) struct TestFile {
@@ -363,6 +498,9 @@ pub(crate) mod testutil {
         pub uncomp_rsrc: u32,
         pub block_data_off: u32,
         pub block_rsrc_off: u32,
+        pub depth: u16,
+        pub crc32: u32,
+        pub modified: u32,
     }
 
     /// An FVCT record with the name as its last field, two bytes after the
@@ -379,15 +517,19 @@ pub(crate) mod testutil {
         put(FVCT_DATA_OFFSET, f.data_offset);
         put(FVCT_BLOCK_DATA_OFF, f.block_data_off);
         put(FVCT_BLOCK_RSRC_OFF, f.block_rsrc_off);
+        put(super::FVCT_CRC, f.crc32);
+        put(super::FVCT_MODIFIED, f.modified);
+        r[super::FVCT_DEPTH..super::FVCT_DEPTH + 2].copy_from_slice(&f.depth.to_be_bytes());
         r[FVCT_SEGMENT..FVCT_SEGMENT + 2].copy_from_slice(&f.segment.to_be_bytes());
         r[FVCT_NLEN] = u8::try_from(f.name.len()).unwrap();
         r.extend_from_slice(f.name.as_bytes());
         r
     }
 
-    pub(crate) fn dvct_record(name: &str) -> Vec<u8> {
+    pub(crate) fn dvct_record(name: &str, depth: u16) -> Vec<u8> {
         let mut r = vec![0u8; DVCT_NLEN + 2];
         r[..4].copy_from_slice(b"DVCT");
+        r[super::DVCT_DEPTH..super::DVCT_DEPTH + 2].copy_from_slice(&depth.to_be_bytes());
         r[DVCT_NLEN] = u8::try_from(name.len()).unwrap();
         r.extend_from_slice(name.as_bytes());
         r
@@ -397,6 +539,10 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_roman(data: &[u8]) -> Result<ArchiveInfo, Error> {
+        parse(data, NameEncoding::MacRoman)
+    }
 
     fn make_tag_body(tags: &[(&[u8; 4], usize)]) -> Vec<u8> {
         let total: usize = tags.iter().map(|(_, sz)| 4 + sz).sum();
@@ -459,7 +605,7 @@ mod tests {
         assert_eq!(tags.len(), 2);
         let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
         assert_eq!(off, 184);
-        assert_eq!(mac_str(&data, off, 6), "myfile");
+        assert_eq!(mac_str(&data, off, 6, NameEncoding::MacRoman), "myfile");
     }
 
     #[test]
@@ -498,13 +644,13 @@ mod tests {
     fn parse_rejects_oversized_cvct_body() {
         // body-size field points past the archive; without the bounds check the
         // `data[comp_start..comp_end]` slice would panic
-        assert!(parse(&compressed_cvct(&[0xAB; 8], 0xFFFF)).is_err());
+        assert!(parse_roman(&compressed_cvct(&[0xAB; 8], 0xFFFF)).is_err());
     }
 
     #[test]
     fn parse_survives_garbage_cvct_body() {
         // a non-DEFLATE compressed directory errors cleanly, never panics or hangs
-        assert!(parse(&compressed_cvct(&[0xFF; 64], 64)).is_err());
+        assert!(parse_roman(&compressed_cvct(&[0xFF; 64], 64)).is_err());
     }
 
     #[test]
@@ -512,6 +658,6 @@ mod tests {
         let mut buf = vec![0u8; 0x40];
         buf[0..4].copy_from_slice(b"SVCT");
         buf[0x24..0x28].copy_from_slice(&0xFFFFu32.to_be_bytes());
-        assert!(parse(&buf).is_err());
+        assert!(parse_roman(&buf).is_err());
     }
 }

@@ -10,7 +10,8 @@ use crate::Error;
 ///
 /// Returns `(payload_slice, file_offset)`: the `_mvdata` section contents if
 /// present, otherwise the overlay region past the last section. The file
-/// offset is needed to translate V0-era blob offsets (which are file-relative)
+/// offset is needed to translate the blob offsets of the pre-4.x runtimes, which count from
+/// the start of the file
 ///
 /// # Errors
 ///
