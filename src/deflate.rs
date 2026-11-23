@@ -2,7 +2,7 @@
 //!
 //! All compressed data passes through three stages: byte-pair swap, a
 //! 256-byte substitution table, then DEFLATE decompression. This pipeline
-//! is shared across all observed VISE format versions (v2 and v3).
+//! is the same in every Mac format version.
 //!
 //! The v3 variant reads bits from big-endian 16-bit words and aligns stored
 //! blocks to 16-bit boundaries (`bits & 0xf` rather than zlib's `bits & 0x7`).
@@ -22,16 +22,16 @@ const MIN_HEADROOM: usize = 65536;
 /// 2 bits, so 258*8/2 = 1032 bytes out per byte in. No valid stream exceeds this,
 /// so anything past it is a decompression bomb
 const MAX_EXPANSION_RATIO: usize = 1032;
-/// Longest DEFLATE back-reference (max match length). The final match of a
-/// stream may copy this far past `expected` before the trailing `truncate`, so
-/// the cap adds it as slack
-const MAX_MATCH: usize = 258;
-/// Output chunk pulled from flate2 per iteration when decompressing incrementally
+/// Smallest step the output buffer grows by while flate2 is producing bytes
 const INFLATE_CHUNK: usize = 64 * 1024;
 /// Ceiling on the starting output capacity. The declared `expected` is used as
 /// a hint only up to this, so a bogus header can't request a huge reservation
 /// up front
 const INITIAL_OUTPUT_CAP: usize = 1 << 20;
+/// Expansion ratio up to which a declared size is reserved in full up front.
+/// Real files rarely compress better than this; one that does still decodes,
+/// its buffer just grows as it goes
+const TYPICAL_MAX_RATIO: usize = 32;
 
 /// Substitution table: a bijective 256-byte permutation applied to the
 /// compressed data in Mac archives
@@ -57,8 +57,8 @@ pub const CIPHER: [u8; 256] = [
 /// Reverses the VISE encoding layer in place
 ///
 /// Adjacent byte pairs are swapped, then each byte is substituted through the
-/// permutation table. This transformation precedes DEFLATE decompression in all
-/// VISE archives
+/// permutation table. This transformation precedes DEFLATE decompression in Mac
+/// archives
 pub fn decode_in_place(buf: &mut [u8]) {
     let (pairs, tail) = buf.split_at_mut(buf.len() & !1);
     for pair in pairs.chunks_exact_mut(2) {
@@ -74,79 +74,88 @@ pub fn decode_in_place(buf: &mut [u8]) {
 
 /// Decrypts and decompresses a VISE compressed block
 ///
-/// Tries standard DEFLATE via flate2 first. Falls back to the word-aligned
-/// decoder when flate2 produces a length mismatch or decompression error.
-/// Pass `expected = 0` when the output size is unknown (shared blocks)
+/// The stream is either standard DEFLATE or the word-aligned variant; see
+/// `decompress` for how the two are told apart. Pass `expected = 0` when
+/// the output size is unknown (shared blocks)
 ///
 /// # Errors
 ///
-/// Returns [`Error::Decompression`] if both the flate2 fast path and the
-/// word-aligned fallback fail to produce `expected` bytes
+/// Returns [`Error::Decompression`] if neither decoder produces exactly
+/// `expected` bytes
 pub fn decode_and_decompress(src: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     let mut decoded = src.to_vec();
     decode_in_place(&mut decoded);
+    decompress(&decoded, expected, expected)
+}
 
-    match inflate(&decoded, expected) {
+/// Decompresses a stream that is either standard DEFLATE or the word-aligned
+/// variant. The two differ only in how stored blocks are aligned, so a stream
+/// without stored blocks decodes the same either way, and one with them
+/// decodes under exactly one
+///
+/// zlib is about twice as fast on compressed blocks, so it goes first and the
+/// word-aligned decoder takes the streams it rejects
+///
+/// `expected` is the size the output must have, or 0 to accept any.
+/// `size_hint` is the likely size, used to size the output buffer
+fn decompress(input: &[u8], expected: usize, size_hint: usize) -> Result<Vec<u8>, Error> {
+    decompress_within(input, expected, size_hint, usize::MAX)
+}
+
+/// [`decompress`] with the output also held to `cap` bytes
+fn decompress_within(
+    input: &[u8],
+    expected: usize,
+    size_hint: usize,
+    cap: usize,
+) -> Result<Vec<u8>, Error> {
+    match inflate(input, expected, size_hint, cap) {
         Some(out) => Ok(out),
-        // word-aligned stored blocks defeat standard inflate; the custom decoder
-        // handles those and applies the same output bound
-        None => word_deflate(&decoded, expected),
+        None => word_deflate_hinted(input, expected, size_hint, cap).map(|(out, _)| out),
     }
 }
 
-/// Standard DEFLATE via flate2, pulled in fixed chunks so the output bound is
-/// enforced as bytes are produced and no buffer is ever sized from the
-/// attacker-controlled `expected`. Returns `None` to signal the caller should
-/// fall back to the word-aligned decoder: flate2 declined the stream, stalled,
-/// the output ran past what the input could legitimately produce, or it did not
-/// yield exactly `expected` bytes
-fn inflate(input: &[u8], expected: usize) -> Option<Vec<u8>> {
+/// Standard DEFLATE via flate2, written straight into the output buffer. The
+/// buffer grows as bytes are produced and is never sized from the
+/// attacker-controlled `expected`. Returns `None` when flate2 declines the
+/// stream, stalls, runs past what the input could legitimately produce, or
+/// does not yield exactly `expected` bytes
+fn inflate(input: &[u8], expected: usize, size_hint: usize, cap: usize) -> Option<Vec<u8>> {
     thread_local! {
-        static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0u8; INFLATE_CHUNK]);
         static DEC: std::cell::RefCell<flate2::Decompress> = std::cell::RefCell::new(flate2::Decompress::new(false));
     }
 
-    let max_out = output_ceiling(input.len(), expected);
-    let hint = if expected > 0 {
-        expected
-    } else {
-        input.len().saturating_mul(4)
-    };
-    let mut out = Vec::with_capacity(hint.min(INITIAL_OUTPUT_CAP).min(max_out));
+    let max_out = output_ceiling(input.len(), expected).min(cap);
+    let mut out = Vec::with_capacity(initial_capacity(input.len(), size_hint, max_out));
 
-    let result = SCRATCH.with(|scratch_cell| {
-        DEC.with(|dec_cell| {
-            let mut scratch = scratch_cell.borrow_mut();
-            let mut dec = dec_cell.borrow_mut();
-            dec.reset(false);
-            inflate_inner(input, expected, max_out, &mut out, &mut scratch, &mut dec)
-        })
+    let finished = DEC.with(|dec_cell| {
+        let mut dec = dec_cell.borrow_mut();
+        dec.reset(false);
+        inflate_into(input, max_out, &mut out, &mut dec)
     });
 
-    if result { Some(out) } else { None }
+    (finished && (expected == 0 || out.len() == expected)).then_some(out)
 }
 
-fn inflate_inner(
+fn inflate_into(
     input: &[u8],
-    expected: usize,
     max_out: usize,
     out: &mut Vec<u8>,
-    scratch: &mut [u8],
     dec: &mut flate2::Decompress,
 ) -> bool {
     loop {
+        if out.len() == out.capacity() {
+            out.reserve(INFLATE_CHUNK);
+        }
         let in_before = dec.total_in();
-        let out_before = dec.total_out();
+        let out_before = out.len();
+        // total_in is u64; VISE archives are well under 4 GB
         #[allow(clippy::cast_possible_truncation)]
-        let status = dec.decompress(
+        let status = dec.decompress_vec(
             &input[in_before as usize..],
-            scratch,
+            out,
             flate2::FlushDecompress::None,
         );
-        // total_in/total_out are u64; VISE archives are well under 4 GB
-        #[allow(clippy::cast_possible_truncation)]
-        let produced = (dec.total_out() - out_before) as usize;
-        out.extend_from_slice(&scratch[..produced]);
 
         // beyond what this input could legitimately expand to: a bomb, bail out
         if out.len() > max_out {
@@ -154,38 +163,82 @@ fn inflate_inner(
         }
 
         match status {
-            Ok(flate2::Status::StreamEnd) => break,
+            Ok(flate2::Status::StreamEnd) => return true,
             Ok(_) => {
-                #[allow(clippy::cast_possible_truncation)]
-                let consumed = (dec.total_in() - in_before) as usize;
                 // no input taken and no output made: stalled (e.g. truncated stream)
-                if consumed == 0 && produced == 0 {
+                if dec.total_in() == in_before && out.len() == out_before {
                     return false;
                 }
             }
             Err(_) => return false,
         }
     }
-
-    // accept only an exact match (or an unknown size); a short or long result
-    // defers to the word-aligned decoder, preserving the prior fall-back behavior
-    expected == 0 || out.len() == expected
 }
 
-/// Byte-pair swap + standard DEFLATE without the substitution cipher.
-/// Used by Windows VISE archives which omit the cipher table
-pub(crate) fn swap_and_inflate(src: &[u8]) -> Option<Vec<u8>> {
+/// Starting capacity for an output buffer: the likely size plus one byte, so
+/// a stream that produces exactly that much still has room for the decoder
+/// to report its end without growing the buffer
+fn initial_capacity(comp_len: usize, size_hint: usize, max_out: usize) -> usize {
+    let hint = if size_hint > 0 {
+        size_hint
+    } else {
+        comp_len.saturating_mul(4)
+    };
+    // the hint comes from the archive, so it is believed only as far as the
+    // input makes plausible: a typical ratio, or the fixed cap for tiny inputs
+    let believable = comp_len
+        .saturating_mul(TYPICAL_MAX_RATIO)
+        .max(INITIAL_OUTPUT_CAP);
+    hint.min(believable).min(max_out).saturating_add(1)
+}
+
+/// Byte-pair swap + DEFLATE without the substitution cipher.
+/// Used by Windows VISE archives which omit the cipher table.
+/// `expected` is the size the file table records, which the output must
+/// match, or 0 when it records none
+pub(crate) fn swap_and_inflate(src: &[u8], expected: usize) -> Option<Vec<u8>> {
+    with_pairs_swapped(src, |swapped| decompress(swapped, expected, expected).ok())
+}
+
+/// [`swap_and_inflate`] for a stream whose size is not trusted: any size is
+/// accepted up to `limit` bytes, and `size_hint` only sizes the buffer
+pub(crate) fn swap_and_inflate_within(
+    src: &[u8],
+    size_hint: usize,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    with_pairs_swapped(src, |swapped| {
+        decompress_within(swapped, 0, size_hint, limit).ok()
+    })
+}
+
+/// A swapped copy kept between calls is given back to the allocator when it
+/// is larger than this
+const SWAP_SCRATCH_KEEP: usize = 4 << 20;
+
+/// Runs `decode` on `src` with each pair of bytes swapped. The copy is made
+/// in a buffer each thread keeps, so reading many small files does not
+/// allocate one per file
+fn with_pairs_swapped<R>(src: &[u8], decode: impl FnOnce(&[u8]) -> Option<R>) -> Option<R> {
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
     if src.len() < 2 {
         return None;
     }
-    let mut swapped = src.to_vec();
-    for pair in swapped.chunks_exact_mut(2) {
-        pair.swap(0, 1);
-    }
-    match inflate(&swapped, 0) {
-        Some(out) => Some(out),
-        None => word_deflate(&swapped, 0).ok(),
-    }
+    SCRATCH.with(|cell| {
+        let mut swapped = cell.borrow_mut();
+        swapped.clear();
+        swapped.extend_from_slice(src);
+        for pair in swapped.chunks_exact_mut(2) {
+            pair.swap(0, 1);
+        }
+        let result = decode(&swapped);
+        if swapped.capacity() > SWAP_SCRATCH_KEEP {
+            *swapped = Vec::new();
+        }
+        result
+    })
 }
 
 /// Decompresses raw word-aligned DEFLATE without the byte-swap + substitution layer
@@ -198,30 +251,23 @@ pub(crate) fn swap_and_inflate(src: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Returns [`Error::Decompression`] if the input is not valid word-aligned DEFLATE
 pub fn decompress_raw_word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
-    swap_and_deflate_with_consumed(input, expected).map(|(data, _)| data)
-}
-
-/// Byte-swap + word-aligned DEFLATE, returning input bytes consumed
-pub fn swap_and_deflate_with_consumed(
-    input: &[u8],
-    expected: usize,
-) -> Result<(Vec<u8>, usize), Error> {
     let mut swapped = input.to_vec();
     for pair in swapped.chunks_exact_mut(2) {
         pair.swap(0, 1);
     }
-    word_deflate_with_consumed(&swapped, expected)
+    word_deflate(&swapped, expected)
 }
 
 /// Largest output `comp_len` compressed bytes could legitimately produce. A
-/// declared size (`expected > 0`) is trusted only up to this physical ceiling,
-/// so a lie in the header cannot enlarge the bound
+/// declared size (`expected > 0`) is the limit when it is smaller, since the
+/// output has to match it exactly; it is never trusted past the physical
+/// ceiling, so a lie in the header cannot enlarge the bound
 fn output_ceiling(comp_len: usize, expected: usize) -> usize {
     let ratio_cap = comp_len
         .saturating_mul(MAX_EXPANSION_RATIO)
         .saturating_add(MIN_HEADROOM);
     if expected > 0 {
-        expected.saturating_add(MAX_MATCH).min(ratio_cap)
+        expected.min(ratio_cap)
     } else {
         ratio_cap
     }
@@ -232,22 +278,25 @@ fn output_ceiling(comp_len: usize, expected: usize) -> usize {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Decompression`] if the stream is malformed, ends before
-/// `expected` bytes are produced, or expands past what its input could
+/// Returns [`Error::Decompression`] if the stream is malformed, does not
+/// produce exactly `expected` bytes, or expands past what its input could
 /// legitimately produce
 pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
-    word_deflate_with_consumed(input, expected).map(|(data, _)| data)
+    word_deflate_hinted(input, expected, expected, usize::MAX).map(|(data, _)| data)
 }
 
-/// Like [`word_deflate`], but also returns the number of input bytes consumed
-pub fn word_deflate_with_consumed(
+/// [`word_deflate`] with a separate buffer-size hint. Also returns the number
+/// of input bytes the stream occupied
+fn word_deflate_hinted(
     input: &[u8],
     expected: usize,
+    size_hint: usize,
+    cap: usize,
 ) -> Result<(Vec<u8>, usize), Error> {
-    let max_out = output_ceiling(input.len(), expected);
+    let max_out = output_ceiling(input.len(), expected).min(cap);
 
     let mut br = WordBitReader::new(input);
-    let mut out = Vec::with_capacity(expected.min(max_out));
+    let mut out = Vec::with_capacity(initial_capacity(input.len(), size_hint, max_out));
 
     loop {
         let bfinal = br.read_bits(1);
@@ -255,20 +304,7 @@ pub fn word_deflate_with_consumed(
         let progress_mark = out.len();
 
         match btype {
-            0 => {
-                br.align16();
-                let len = br.read_bits(16) as usize;
-                let nlen = br.read_bits(16);
-                if len != ((!nlen) & 0xffff) as usize {
-                    return Err(Error::Decompression(format!(
-                        "stored block LEN/NLEN mismatch: {len} vs {nlen}"
-                    )));
-                }
-                if out.len() + len > max_out {
-                    return Err(bomb_error(max_out));
-                }
-                br.copy_stored(len, &mut out)?;
-            }
+            0 => br.copy_stored(&mut out, max_out)?,
             1 => decode_huffman_block(&mut br, &mut out, true, max_out)?,
             2 => decode_huffman_block(&mut br, &mut out, false, max_out)?,
             _ => return Err(Error::Decompression(format!("invalid block type {btype}"))),
@@ -287,22 +323,25 @@ pub fn word_deflate_with_consumed(
         }
     }
 
-    if expected > 0 {
-        if out.len() < expected {
-            return Err(Error::Decompression(format!(
-                "stream ended after {} of {expected} bytes",
-                out.len()
-            )));
-        }
-        out.truncate(expected);
+    // more than `expected` is caught as it is produced, by the output ceiling
+    if expected > 0 && out.len() < expected {
+        return Err(Error::Decompression(format!(
+            "stream ended after {} of {expected} bytes",
+            out.len()
+        )));
     }
-    Ok((out, br.pos))
+    Ok((out, br.consumed()))
 }
 
+/// Reads bits lowest-first from a byte stream, as DEFLATE packs them, with
+/// the stored-block alignment of the VISE variant
 struct WordBitReader<'a> {
     data: &'a [u8],
+    /// Next byte of `data` to load into `bits`
     pos: usize,
-    bits: u32,
+    /// Loaded bits not yet consumed, next bit lowest. Bits above `nbits` are
+    /// either zero or a copy of what `data[pos..]` will supply
+    bits: u64,
     nbits: u32,
 }
 
@@ -316,92 +355,83 @@ impl<'a> WordBitReader<'a> {
         }
     }
 
+    /// Loads as many whole bytes as fit. Afterwards `nbits` is at least 56
+    /// unless the input has run out
     #[inline]
-    fn ensure_bits(&mut self, need: u32) {
-        while self.nbits < need {
-            if self.pos + 1 < self.data.len() {
-                let lo = u32::from(self.data[self.pos]);
-                let hi = u32::from(self.data[self.pos + 1]);
-                self.bits |= lo << self.nbits;
-                self.bits |= hi << (self.nbits + 8);
-                self.nbits += 16;
-                self.pos += 2;
-            } else if self.pos < self.data.len() {
-                self.bits |= u32::from(self.data[self.pos]) << self.nbits;
-                self.nbits += 8;
+    fn refill(&mut self) {
+        if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            self.bits |= word << self.nbits;
+            let bytes = (63 - self.nbits) >> 3;
+            self.pos += bytes as usize;
+            self.nbits += bytes * 8;
+        } else {
+            while self.nbits <= 56 && self.pos < self.data.len() {
+                self.bits |= u64::from(self.data[self.pos]) << self.nbits;
                 self.pos += 1;
-            } else {
-                return;
+                self.nbits += 8;
             }
         }
     }
 
+    /// Reads `n` bits, at most 16. Past the end of the input the missing
+    /// bits read as zero
     #[inline]
     fn read_bits(&mut self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
+        if self.nbits < n {
+            self.refill();
         }
-        self.ensure_bits(n);
-        let val = self.bits & ((1u32 << n) - 1);
+        #[allow(clippy::cast_possible_truncation)]
+        let val = (self.bits & ((1u64 << n) - 1)) as u32;
         self.bits >>= n;
-        // saturating: at end-of-input ensure_bits cannot supply `n` bits, so
-        // avoid underflowing nbits (which would panic in debug and wrap to a
-        // huge value in release, spinning the decoder)
+        // saturating: at end-of-input refill cannot supply `n` bits, and an
+        // underflow here would wrap to a huge count and spin the decoder
         self.nbits = self.nbits.saturating_sub(n);
         val
     }
 
-    /// Discards bits until the accumulator is at a 16-bit boundary.
-    ///
-    /// 16-bit alignment (`bits & 0xf`) not zlib's 8-bit (`bits & 0x7`)
-    #[inline]
-    const fn align16(&mut self) {
-        let discard = self.nbits % 16;
-        if discard > 0 {
-            self.bits >>= discard;
-            self.nbits -= discard;
-        }
+    /// Input bytes used so far, counting a partly read byte as used
+    fn consumed(&self) -> usize {
+        self.pos - (self.nbits / 8) as usize
     }
 
-    /// Copies the `len` bytes of a stored block to `out`, then skips the pad
-    /// byte that follows an odd-length run so the next block starts on a
-    /// 16-bit boundary. Call after the LEN/NLEN words have been read
+    /// Moves to the next 16-bit boundary of the input, discarding the bits
+    /// before it and anything loaded ahead
     ///
-    /// Errors if the input ends before `len` bytes are available
-    fn copy_stored(&mut self, len: usize, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut remaining = len;
-        // whole bytes already pulled into the bit buffer come first
-        while remaining > 0 && self.nbits >= 8 {
-            #[allow(clippy::cast_possible_truncation)]
-            out.push(self.bits as u8);
-            self.bits >>= 8;
-            self.nbits -= 8;
-            remaining -= 1;
-        }
-        if remaining > 0 {
-            // the buffer holds no whole byte, so the rest is copied straight
-            // from the input
-            self.bits = 0;
-            self.nbits = 0;
-            let end = self
-                .pos
-                .checked_add(remaining)
-                .filter(|&e| e <= self.data.len())
-                .ok_or_else(|| {
-                    Error::Decompression("stored block runs past end of input".into())
-                })?;
-            out.extend_from_slice(&self.data[self.pos..end]);
-            self.pos = end;
-        }
-        if len % 2 == 1 {
-            if self.nbits >= 8 {
-                self.bits >>= 8;
-                self.nbits -= 8;
-            } else if self.pos < self.data.len() {
-                self.pos += 1;
-            }
-        }
+    /// 16-bit alignment (`bits & 0xf`) not zlib's 8-bit (`bits & 0x7`)
+    fn align16(&mut self) {
+        self.pos = self.consumed().next_multiple_of(2).min(self.data.len());
+        self.bits = 0;
+        self.nbits = 0;
+    }
+
+    /// Copies a stored block to `out`: aligns to a 16-bit boundary, reads
+    /// the LEN/NLEN words, copies LEN bytes, then skips the pad byte that
+    /// follows an odd-length run so the next block starts on a boundary
+    ///
+    /// Errors if the lengths disagree, the input ends before LEN bytes are
+    /// available, or the output would pass `max_out`
+    fn copy_stored(&mut self, out: &mut Vec<u8>, max_out: usize) -> Result<(), Error> {
         self.align16();
+        let past_end = || Error::Decompression("stored block runs past end of input".into());
+
+        let header = self.data.get(self.pos..self.pos + 4).ok_or_else(past_end)?;
+        let len = usize::from(u16::from_le_bytes([header[0], header[1]]));
+        let nlen = usize::from(u16::from_le_bytes([header[2], header[3]]));
+        if len != !nlen & 0xffff {
+            return Err(Error::Decompression(format!(
+                "stored block LEN/NLEN mismatch: {len} vs {nlen}"
+            )));
+        }
+        if out.len() + len > max_out {
+            return Err(bomb_error(max_out));
+        }
+
+        let start = self.pos + 4;
+        let body = self.data.get(start..start + len).ok_or_else(past_end)?;
+        out.extend_from_slice(body);
+        // the pad byte may be missing after the last block
+        self.pos = (start + len).next_multiple_of(2).min(self.data.len());
         Ok(())
     }
 }
@@ -491,10 +521,15 @@ fn reverse_bits(val: u32, len: u8) -> u32 {
 
 #[inline]
 fn decode_symbol(reader: &mut WordBitReader, table: &HuffmanTable) -> Result<u32, Error> {
-    reader.ensure_bits(MAX_CODE_BITS);
-    let (sym, len) = table.fast[(reader.bits & table.fast_mask) as usize];
+    if reader.nbits < MAX_CODE_BITS {
+        reader.refill();
+    }
+    // masked to at most FAST_BITS bits
+    #[allow(clippy::cast_possible_truncation)]
+    let index = (reader.bits & u64::from(table.fast_mask)) as usize;
+    let (sym, len) = table.fast[index];
     // Require the matched code to fit within the bits actually read from input.
-    // At end-of-input ensure_bits pads with zeros; without this check a truncated
+    // At end-of-input the missing bits read as zero; without this check a truncated
     // stream would decode phantom symbols forever and underflow nbits.
     if len > 0 && u32::from(len) <= reader.nbits {
         reader.bits >>= len;
@@ -513,7 +548,7 @@ fn decode_symbol_canonical(reader: &mut WordBitReader, table: &HuffmanTable) -> 
     let mut first = 0u32;
     let mut index = 0usize;
     for len in 1..=reader.nbits.min(MAX_CODE_BITS) {
-        code |= (reader.bits >> (len - 1)) & 1;
+        code |= u32::from(reader.bits >> (len - 1) & 1 != 0);
         let count = u32::from(table.count[len as usize]);
         if code < first + count {
             let sym = table
@@ -565,38 +600,45 @@ fn decode_huffman_block(
     };
 
     loop {
-        let sym = decode_symbol(reader, lit_table)?;
-        if sym == 256 {
-            break;
+        // one load covers a whole length/distance pair: two codes of up to
+        // 15 bits, 5 extra length bits and 13 extra distance bits
+        if reader.nbits < 2 * MAX_CODE_BITS + 5 + 13 {
+            reader.refill();
         }
+        let sym = decode_symbol(reader, lit_table)?;
         if sym < 256 {
             if out.len() >= max_out {
                 return Err(bomb_error(max_out));
             }
             #[allow(clippy::cast_possible_truncation)]
             out.push(sym as u8);
-        } else {
-            let length = decode_length(reader, sym)?;
-            let dist_sym = decode_symbol(reader, dist_table)?;
-            let distance = decode_distance(reader, dist_sym)?;
-            if distance > out.len() {
-                return Err(Error::Decompression(format!(
-                    "back-reference distance {distance} exceeds output length {}",
-                    out.len()
-                )));
-            }
-            if out.len() + length > max_out {
-                return Err(bomb_error(max_out));
-            }
-            if distance >= length {
-                let start = out.len() - distance;
-                out.extend_from_within(start..start + length);
-            } else {
-                for _ in 0..length {
-                    let idx = out.len() - distance;
-                    out.push(out[idx]);
-                }
-            }
+            continue;
+        }
+        if sym == 256 {
+            break;
+        }
+
+        let length = decode_length(reader, sym)?;
+        let dist_sym = decode_symbol(reader, dist_table)?;
+        let distance = decode_distance(reader, dist_sym)?;
+        if distance > out.len() {
+            return Err(Error::Decompression(format!(
+                "back-reference distance {distance} exceeds output length {}",
+                out.len()
+            )));
+        }
+        if out.len() + length > max_out {
+            return Err(bomb_error(max_out));
+        }
+        // A match longer than its distance repeats what it has just written.
+        // Each pass copies everything from the match start to the current
+        // end, so the copied run doubles until the length is covered
+        let start = out.len() - distance;
+        let mut remaining = length;
+        while remaining > 0 {
+            let run = remaining.min(out.len() - start);
+            out.extend_from_within(start..start + run);
+            remaining -= run;
         }
     }
     Ok(())
@@ -765,7 +807,7 @@ mod tests {
         input.extend(stored_block(b"x", true));
         assert_eq!(word_deflate(&input, 0).unwrap(), b"oddevenx");
         assert_eq!(word_deflate(&input, 8).unwrap(), b"oddevenx");
-        let (_, consumed) = word_deflate_with_consumed(&input, 0).unwrap();
+        let (_, consumed) = word_deflate_hinted(&input, 0, 0, usize::MAX).unwrap();
         assert_eq!(consumed, input.len());
     }
 
@@ -844,7 +886,7 @@ mod tests {
             .map(|_| {
                 state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let r = state >> 8;
-                // leading_zeros of a 24-bit value gives a geometric spread
+                // the number of trailing zero bits gives a geometric spread
                 let bucket = (r | 1).trailing_zeros().min(23);
                 u8::try_from(bucket * 9 + ((r >> 12) % 9)).unwrap()
             })
@@ -895,7 +937,7 @@ mod tests {
     #[test]
     fn output_cap_rejects_bomb() {
         // 200 KB of zeros deflates to a tiny stream. With expected = 1 the cap is
-        // 1 + MAX_MATCH, so the expansion must be rejected, not allocated
+        // one byte, so the expansion must be rejected, not allocated
         let compressed = raw_deflate(&vec![0u8; 200_000]);
         let Err(Error::Decompression(msg)) = word_deflate(&compressed, 1) else {
             panic!("expected a decompression-bomb error");
@@ -929,17 +971,21 @@ mod tests {
         // is not a chunk multiple, exercising the incremental loop boundaries
         let raw: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         let compressed = raw_deflate(&raw);
-        assert_eq!(inflate(&compressed, raw.len()).unwrap(), raw);
+        assert_eq!(
+            inflate(&compressed, raw.len(), raw.len(), usize::MAX).unwrap(),
+            raw
+        );
         // the unknown-size (shared-block) path returns everything as well
-        assert_eq!(inflate(&compressed, 0).unwrap(), raw);
+        assert_eq!(inflate(&compressed, 0, 0, usize::MAX).unwrap(), raw);
     }
 
     #[test]
     fn inflate_bails_on_bomb() {
-        // 200 KB of zeros -> tiny stream; with expected = 1 the ceiling is ~259,
-        // so the chunk loop stops and signals fall-back rather than expanding
+        // 200 KB of zeros -> tiny stream; with expected = 1 the ceiling is one
+        // byte, so the chunk loop stops and signals fall-back instead of
+        // expanding
         let compressed = raw_deflate(&vec![0u8; 200_000]);
-        assert!(inflate(&compressed, 1).is_none());
+        assert!(inflate(&compressed, 1, 1, usize::MAX).is_none());
     }
 
     #[test]
@@ -947,7 +993,7 @@ mod tests {
         let raw = vec![7u8; 100_000];
         let mut compressed = raw_deflate(&raw);
         compressed.truncate(compressed.len() / 2);
-        assert!(inflate(&compressed, raw.len()).is_none());
+        assert!(inflate(&compressed, raw.len(), raw.len(), usize::MAX).is_none());
     }
 
     #[test]
@@ -990,8 +1036,8 @@ mod tests {
 
     #[test]
     fn decompress_raw_word_deflate_real_cvct() {
-        // Captured 194-byte compressed CVCT body; decompresses to a 432-byte
-        // record stream starting with an FVCT tag
+        // A 194-byte compressed CVCT body from an archive; decompresses to a
+        // 432-byte record stream starting with an FVCT tag
         #[rustfmt::skip]
         const BODY: [u8; 194] = [
             0x90, 0xcd, 0x0a, 0xbd, 0x60, 0x82, 0x86, 0x14, 0x4f, 0xdf, 0x24, 0x2d, 0xba, 0x0c, 0xdb, 0x04,
@@ -1015,9 +1061,8 @@ mod tests {
 
     #[test]
     fn truncated_stream_errors_instead_of_spinning() {
-        // The same valid CVCT body cut off mid-stream. Before the EOF guards a
-        // truncated stream could decode phantom symbols until it filled the
-        // output cap (or panicked in debug); now it must terminate with an Err.
+        // a valid CVCT body cut off mid-stream has to end in an error, not
+        // go on decoding symbols out of nothing
         const BODY: [u8; 32] = [
             0x90, 0xcd, 0x0a, 0xbd, 0x60, 0x82, 0x86, 0x14, 0x4f, 0xdf, 0x24, 0x2d, 0xba, 0x0c,
             0xdb, 0x04, 0x08, 0x2b, 0xa5, 0xa1, 0x7f, 0xc5, 0x41, 0x11, 0xa2, 0x3f, 0x03, 0x1a,

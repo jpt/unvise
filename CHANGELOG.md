@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+- Files are checked against the CRC-32 the archive stores for them: per file record on Windows, and over the data fork followed by the resource fork on Mac. A mismatch is `Error::Checksum` and the file is not written
+- Three more Windows record layouts: runtimes up to 4.6, and the pre-4.x runtimes of Installer VISE 2.4 and 2.5. Installers from these previously yielded only their embedded support DLLs, reported as a successful extraction
+- `--forks appledouble` and `--forks macbinary` keep type and creator codes, Finder flags and the resource fork: as a `._name` sidecar that macOS merges back, or as one `name.bin` file. In the library: `ExtractOptions`, `ForkFormat` and `Archive::extract_with_options`. The default is still `name.rsrc`
+- Extracted files get the modification time the archive records, Mac and Windows
+- `FileEntry` has `dir`, `name_bytes`, `finder_flags`, `created`, `modified` and `crc32`, with `modified_time`, `created_time` and `finder_info`. `WinEntry` has `modified` and `crc32`
+- `macbinary::encode` and the `appledouble` module
+- Names are decoded in the installer's own encoding instead of always Mac Roman (Mac) or UTF-8 (Windows). A Mac installer's script is read from the region code of its `vers` resource when the input is a MacBinary file, and `--encoding` overrides it; a Windows installer's code page follows from the language ID in its language table. In the library: `NameEncoding`, `mac_name_encoding`, `Archive::parse_with_encoding`, `Archive::parse_segments_with_encoding`, `macbinary::resource_fork` and `macbinary::region`. Japanese, Korean, Chinese and Cyrillic names now come out readable
+- Mac OS X installer bundles (format 0b 00), including those that keep the file table and the file data in separate files inside the bundle; given either file, the CLI finds the other. In the library: `Archive::parse_with_data_file`
+- Windows multi-part installers (`Setup.exe`, `Setup.002`, …): the later parts are found next to the executable and read, including files that run from one part into the next. In the library: `WinArchive::set_volumes`, `last_volume`, `session` and `volume_number`
+- Windows web installers: a file kept in a download item is reported as skipped with `SkipReason::Downloaded` instead of failed. So is a file that does not read in an installer that embeds the download library, when its recorded position could not hold its data. `WinArchiveInfo` has `web`
+- `WinEntry` has `location` (`Location::Installer`, `Part(n)`, `Qdat` or `Download`), which says where its data is
+- `Error::Malformed { what, offset }` for a structure that does not read. Parse errors from the Windows record reader are of this kind and no longer carry formatted text
+- Dependency: `encoding_rs`
+
+### Changed
+- Extraction decodes entries on several threads, in batches bounded by declared size, and still writes and reports them in table order
+- `Entry::Dir` holds the folder's full path from the install root, joined with `PATH_SEPARATOR` (`:`), not just its own name. It and `FileEntry::dir` are `Arc<str>`, shared between a folder and the files in it
+- The word-aligned decoder reads through a 64-bit buffer and copies overlapping matches in doubling runs
+- Output buffers are sized from the declared size when the compressed size makes it plausible, and flate2 writes into them directly
+- A Windows entry's recorded size now bounds the decoder's output instead of being compared afterwards
+- Mac names keep leading and trailing spaces, which some installers use to control load order
+
+### Fixed
+- Mac folders were all created at the top level, so nested folders with the same name were merged and their files overwrote each other. Each record stores its depth; the tree is rebuilt from that
+- Windows mainline (4.x) installers were extracted into one flat folder. Folder records and each record's parent ID give the install tree
+- Two entries that map to the same output path no longer overwrite: the later one is written as `name (2).ext`
+- A `/` in a Mac file name created a folder. It is written as `_`
+- A Mac entry with no data fork that sits in a shared block was decoded as if the whole block were its data fork, which then failed its checksum. A data fork is now read only when it has a size
+- A Mac entry that is the only file entry reading from its block had its block offset ignored and failed to decode. Its fork is now taken from the block at that offset, with the checksum confirming it
+- A Mac file with only a resource fork was written as `name.rsrc` alone in some cases and with an empty `name` beside it in others. The file is now always created under its own name
+- A file that holds a table but no data past it (the table half of an OS X bundle) had its entries decoded out of the table and installer program, and reported as failures. They are skipped as `MissingData`
+- Segment 0 entries were decoded in single-segment archives, where they point at no data, and reported as failures
+- An entry with a size but no stored data, Mac or Windows, was counted as extracted, with nothing written or an empty file. It is now skipped as `MissingData`
+- The Mac name-offset guess measured each record to the next one of the same kind, so a folder record between two files skewed it
+- The word-aligned decoder accepted up to 258 bytes more than the declared size and cut them off
+- The Windows record stream was located by scanning up to 256 KB past the embedded DLLs for bytes that looked like its start. Its position now comes from reading the sections in front of it (language table, settings, variables, download servers, support files, packages). The scan remains for the pre-4.x runtime and for sections that do not read cleanly
+- Windows record-layout detection took the first layout and start position that parsed without an error. Candidates are now compared by how many named files they place inside the payload, and a stream that ends early no longer counts as complete
+- Windows runtime-version detection matched any string starting with `4.` and a digit; it now needs a whole dotted version string
+- A Windows installer whose record stream could not be read was returned as holding only its embedded DLLs. It is now an error
+- Windows screen records (type 0x24) were assumed to be four bytes before 4.8. They carry a subtype; custom dialogs and the destination screen are now read
+- Windows record strings were limited to 260 bytes, which rejected installers with longer message-box text. The limit is 4096
+- The pre-4.x record layout is picked from the build date of the runtime DLL, which separates 2.4, 2.5 and 2.6
+- Windows records whose body is not understood no longer stop the parse. Only folder and file records are used; any other record, and the tail of a file record, is stepped over, and if that does not end on a record header the next header is searched for. The declared record count must still come out exactly.
+- When the sections before the Windows record stream cannot be read, the stream is located from the support-file chain and package list in front of it instead of by a blind scan
+- Whether Windows blob offsets count from the payload or from the executable is settled by decoding a file at both positions
+- Windows files in a part of a multi-part installer that is not there, or past the end of the executable, are reported as skipped instead of failed.
+- The Windows language table may list further languages after the first
+- Mac region codes: Korea is 51, not 23 (Cyprus), and the Cyrillic regions are Russia, Belarus, Ukraine, Serbia, Macedonia and Bulgaria. Korean installers were decoded as Mac Roman
+- Croatian and Serbian (Latin) Windows installers were decoded with the Cyrillic code page
+- Given a bare file name from inside an OS X installer bundle, the other half of the bundle was looked for in the wrong folder
+- A Windows download-item record with no stored data was written as an empty file
+- Limits on hostile input: a wrong recorded size lets a file grow to twice that size and no further; files reading one Mac shared block are decoded in bounded groups; the fallback that reads a Mac entry's stream as a block decodes it once; the search for the next Windows record is charged for every position it examines; Mac folder paths may not add up to more than 64 times the file table
+- A file that could not be written stopped the whole Windows extraction; it is now reported as failed and the rest continues
+- A Windows file whose recorded size is wrong but whose recorded CRC-32 matches the stored data failed to decode. It is decoded without the size and accepted on the CRC
+- Windows package entries hold three localized texts, not two; an installer with translated package names (several languages) could not have its record stream located
+- The search for the next Windows record took bytes inside a record for a record header in installers made of patch records, which then lost count and failed. A folder or file record now has to parse as far as it is used, and a candidate whose parent is a record already read is preferred
+- Windows file records from builds before mid-1999 end four bytes sooner than later ones. Each one was found by searching; they are now read in step
+
 ## 0.3.0
 
 ### Added
