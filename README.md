@@ -109,10 +109,13 @@ Each `FileEntry` carries its folder path (`dir`), type and creator codes, Finder
 src/
 ├── lib.rs          # public API, format detection, shared helpers
 ├── mac.rs          # Mac archive parser (SVCT/CVCT/FVCT chunks)
-├── win/            # Windows archive: payload, layout choice, extraction
+├── win/            # Windows archive parser and extractor
+│   ├── mod.rs      #   archive type, layout choice, reading and extraction
 │   ├── cursor.rs   #   field reader
 │   ├── sections.rs #   DLL chain and the sections before the record stream
-│   └── records.rs  #   record stream, folder and file records
+│   ├── records.rs  #   record stream, folder and file records
+│   ├── testutil.rs #   synthetic payloads for tests and fuzz seeds
+│   └── tests.rs    #   unit tests
 ├── deflate.rs      # decompression pipeline (byte-swap, cipher, DEFLATE)
 ├── pe.rs           # PE payload extraction (_mvdata section or overlay)
 ├── macbinary.rs    # MacBinary wrapper detection, stripping and writing
