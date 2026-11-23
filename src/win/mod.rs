@@ -35,14 +35,18 @@ mod cursor;
 mod records;
 mod sections;
 
-use cursor::Cursor;
-use records::{
-    StreamReading, parse_qdat_entries, parse_record_stream, read_file_fields, skip_type,
-    skip_type2_tail,
-};
+use records::{StreamReading, parse_qdat_entries, parse_record_stream};
 use sections::{
     anchored_stream_start, exact_stream_start, find_first_entry, find_record_stream,
-    skip_to_record_stream, walk_named_chain,
+    walk_named_chain,
+};
+// what only the layout trace reaches for
+#[cfg(any(test, feature = "fuzzing"))]
+use cursor::Cursor;
+#[cfg(feature = "fuzzing")]
+use {
+    records::{read_file_fields, skip_type, skip_type2_tail},
+    sections::skip_to_record_stream,
 };
 
 use crate::text::windows_code_page;

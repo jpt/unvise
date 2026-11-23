@@ -58,6 +58,7 @@ pub(super) struct StreamReading<'a> {
 
 impl StreamReading<'_> {
     /// A stream on its own: offsets as recorded, Western European names
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(super) const fn plain(fmt: RecordFmt) -> Self {
         Self {
             fmt,
