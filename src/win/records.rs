@@ -641,8 +641,8 @@ pub(super) fn skip_dialog(c: &mut Cursor) -> Result<(), Malformed> {
     Ok(())
 }
 
-/// Strips VISE install-path variables: `%SysDir%\Qt\f.dll` becomes
-/// `SysDir/Qt/f.dll`
+/// Strips VISE install-path variables: `%SysDir%\App\f.dll` becomes
+/// `SysDir/App/f.dll`
 pub(super) fn resolve_vise_path(path: &str) -> String {
     let mut result = path.to_string();
     while let Some(start) = result.find('%') {
