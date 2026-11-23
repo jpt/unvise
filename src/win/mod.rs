@@ -1,11 +1,12 @@
 //! Windows VISE archive parser and extractor
 //!
-//! Windows VISE payloads live in a PE `_mvdata` section (Apple builds) or
-//! PE overlay (all other builds). The payload starts with either an SIVM
-//! header (Apple, with trailer offset and session ID) or a bare ESIV header
-//! (everyone else). After a variable-length metadata region, a chain of
-//! embedded DLL entries follows -- the VISE runtime (`vise32ex.dll`) and
-//! resources like language files. The typed record stream comes after
+//! The payload sits in one of two places. Apple's own Windows installers use
+//! a fork of the runtime that keeps it in a PE `_mvdata` section, under an
+//! SIVM header with a trailer offset and session ID. Installers built with
+//! the standard runtime append it after the PE image, under a bare ESIV
+//! header. After a variable-length metadata region, a chain of embedded DLL
+//! entries follows -- the VISE runtime (`vise32ex.dll`) and resources like
+//! language files. The typed record stream comes after
 //!
 //! Seven record layouts exist, one per group of runtime versions. The layout is
 //! chosen from the embedded DLL: its internal ASCII version table, or the

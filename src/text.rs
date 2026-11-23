@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn mac_roman_keeps_ascii_and_maps_the_upper_half() {
         assert_eq!(NameEncoding::MacRoman.decode(b"Read Me"), "Read Me");
-        // "Purple Moon" followed by the folder sign, and an accented name
+        // a name ending in the folder sign, and an accented name
         assert_eq!(NameEncoding::MacRoman.decode(b"Moon \xC4"), "Moon \u{0192}");
         assert_eq!(NameEncoding::MacRoman.decode(b"L\x8Eame"), "L\u{e9}ame");
         // a carriage return, as in the "Icon\r" file, is not a printable name
