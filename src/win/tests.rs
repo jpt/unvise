@@ -1,6 +1,5 @@
 #![allow(clippy::wildcard_imports)]
 
-use super::cursor::*;
 use super::records::*;
 use super::sections::*;
 use super::*;

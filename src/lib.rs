@@ -1786,7 +1786,7 @@ mod tests {
         let squares = parallel_map(1000, |i| i * i);
         assert_eq!(squares.len(), 1000);
         assert!(squares.iter().enumerate().all(|(i, &v)| v == i * i));
-        assert!(parallel_map(0, |i| i).is_empty());
+        assert_eq!(parallel_map(0, |i| i), [] as [usize; 0]);
         assert_eq!(parallel_map(1, |i| i + 7), [7]);
     }
 
