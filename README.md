@@ -253,6 +253,7 @@ CI also runs the formatter and linter:
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets -- -D warnings
 ```
 
 ## Acknowledgements
