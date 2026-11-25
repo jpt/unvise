@@ -665,7 +665,10 @@ mod tests {
         let tags = scan_tags(&data, 0, fvct, dvct);
         assert_eq!(tags, [(0, TagKind::Dvct), (file_at, TagKind::Fvct)]);
         // other bytes are passed over
-        assert!(scan_tags(b"....XXXX....", 0, fvct, dvct).is_empty());
+        assert_eq!(
+            scan_tags(b"....XXXX....", 0, fvct, dvct),
+            Vec::<(usize, TagKind)>::new()
+        );
     }
 
     #[test]
