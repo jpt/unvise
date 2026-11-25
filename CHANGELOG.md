@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.2
+
+### Added
+- `ExtractResult::stopped_early` is set when extraction stops at the output limit. The CLI goes by it for its exit status
+
+### Changed
+- The README is shorter, and its statements about which Mac record fields are read, the Windows stream scan and the Windows file offsets match the code
+
+### Fixed
+- Mac: a compressed file table is limited to 64 MiB once decompressed. A small archive could ask for a great deal of memory
+- Windows names in Thai, Vietnamese, Farsi, Urdu and Albanian installers were decoded with the Western European code page
+- CLI: a `.qdat` file was only found when its extension was in lower case
+- CLI: given the data half of a Mac OS X bundle, the encoding of the names was not read from the table half
+- CLI: the data half of a Mac OS X bundle given from outside its bundle got no warning that the table half was missing
+- CLI: a second file with the number of a segment already in use was reported as following a gap
+- CLI: looking for the other files of an installer no longer opens things that are not regular files, and no longer reads a whole Mac archive to find that it is not a later segment
+- 16-bit Windows executables: a segment or resource shift that pushes bits off the top is refused
+- Documentation of `Archive::parse` and `WinArchive::read` now says what they return
+
 ## 0.5.1
 
 ### Changed

@@ -36,6 +36,9 @@ pub(crate) const FMT_OSX: u8 = 0x0b;
 /// Deepest folder nesting kept. Real installers stay far below this; the cap
 /// bounds the path built for each record of a crafted table
 const MAX_DIR_DEPTH: usize = 64;
+/// Largest file table a compressed one may decompress to. A record is at
+/// least 80 bytes, so this allows several hundred thousand of them
+const MAX_TABLE_LEN: usize = 64 << 20;
 /// Folder paths may add up to this many times the size of the file table
 const PATH_BUDGET_RATIO: usize = 64;
 
@@ -212,7 +215,7 @@ pub(crate) fn parse_as(
                 .ok_or_else(|| {
                     Error::InvalidArchive("compressed CVCT body extends past archive end".into())
                 })?;
-            decompressed_body = deflate::decompress_raw_word_deflate(compressed, 0)?;
+            decompressed_body = deflate::decompress_raw_word_deflate(compressed, MAX_TABLE_LEN)?;
             body_start = 0;
         } else {
             decompressed_body = Vec::new();
