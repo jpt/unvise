@@ -1,23 +1,22 @@
 //! Windows VISE archive parser and extractor
 //!
-//! The payload sits in one of two places. Apple's own Windows installers use
-//! a fork of the runtime that keeps it in a PE `_mvdata` section, under an
-//! SIVM header with a trailer offset and session ID. Installers built with
-//! the standard runtime append it after the PE image, under a bare ESIV
-//! header. After a variable-length metadata region, a chain of embedded DLL
-//! entries follows -- the VISE runtime (`vise32ex.dll`) and resources like
-//! language files. The typed record stream comes after
+//! The payload sits in one of two places: in a PE `_mvdata` section, under
+//! an SIVM header with a trailer offset and session ID, or appended after
+//! the executable, 32-bit or 16-bit, under a bare ESIV header. Its header
+//! ends with a count of embedded files, which follow: the VISE runtime
+//! and what it needs, such as language files. The typed record stream
+//! comes after
 //!
-//! Seven record layouts exist, one per group of runtime versions. The layout is
-//! chosen from the embedded DLL: its internal ASCII version table, or the
-//! `vise32qt` string of the Apple fork, or neither for the pre-4.x runtimes,
-//! whose three layouts are told apart by the DLL's build date. The other
-//! layouts are tried when the chosen one does not parse. See `RecordFmt`
+//! The layout of the records and of what precedes them changed from one
+//! Installer VISE release to the next, and the installer does not say which
+//! release built it. The layouts in `layouts` are tried in turn, and the one
+//! whose sections lead to a record stream that then reads to its end is
+//! used. See `LayoutId`
 //!
-//! Between the DLL chain and the record stream lie several sections (language
-//! table, installer settings, variables, download servers, support files,
-//! packages). They are read through to find where the stream starts; see
-//! `sections::skip_to_record_stream`
+//! Between the embedded files and the record stream lie several sections
+//! (language table, installer settings, variables, download servers, support
+//! files, packages). They are read through to find where the stream starts;
+//! see `sections::skip_to_record_stream`
 //!
 //! Compression is byte-pair swap + raw DEFLATE (no substitution cipher,
 //! unlike the Mac format). Stub installers store the record stream in the
@@ -33,24 +32,21 @@ use std::time::SystemTime;
 use encoding_rs::Encoding;
 
 mod cursor;
+mod grammar;
+mod layouts;
 mod records;
 mod sections;
 
-use records::{StreamReading, parse_qdat_entries, parse_record_stream};
-use sections::{
-    anchored_stream_start, exact_stream_start, find_first_entry, find_record_stream,
-    walk_named_chain,
-};
-// what only the layout trace reaches for
-#[cfg(any(test, feature = "fuzzing"))]
 use cursor::Cursor;
+use grammar::{Op, Text};
+use layouts::{LAYOUTS, LayoutId};
+use records::{StreamReading, parse_qdat_entries, parse_record_stream};
+use sections::{exact_stream_start, find_first_entry, find_record_stream, walk_named_chain};
+// what only the layout trace reaches for
 #[cfg(feature = "fuzzing")]
-use {
-    records::{read_file_fields, skip_type, skip_type2_tail},
-    sections::skip_to_record_stream,
-};
+use {records::skip_type, sections::skip_to_record_stream};
 
-use crate::text::windows_code_page;
+use crate::text::{decode_windows, windows_code_page};
 use crate::{
     BATCH_BYTES, BATCH_ENTRIES, Error, ExtractResult, OUTPUT_BUDGET_HEADROOM, OUTPUT_BUDGET_RATIO,
     Progress, SkipReason, UsedPaths, clean_name, parallel_map, safe_join, write_file,
@@ -60,8 +56,6 @@ use crate::{
 /// SIVM magic and trailer-offset fields)
 const SIVM_BLOB_OFFSET: usize = 8;
 
-/// Highest record type in mainline 4.x streams
-const MAX_RECORD_TYPE: u32 = 0x26;
 const MAX_RECORD_COUNT: u32 = 100_000;
 /// Longest string a record may hold. Paths stay under 260, but message boxes
 /// carry whole paragraphs. The limit is there so a wrong layout fails quickly
@@ -74,7 +68,7 @@ const MAX_ARRAY_COUNT: u16 = 1000;
 /// and some pass 200,000
 const MAX_RECORD_ID: u32 = 0x0100_0000;
 /// Farthest the next record is looked for past the start of a record body
-/// that is not understood. Bodies hold at most a few screens of text
+/// that did not read. Bodies hold at most a few screens of text
 const MAX_RECORD_BODY: usize = 1 << 18;
 /// Deepest folder nesting followed when building an install path
 const MAX_FOLDER_DEPTH: usize = 64;
@@ -98,7 +92,7 @@ const PARENT_LOOKAHEAD: usize = 4096;
 /// Value of the source byte in a file record's tail when the file comes from
 /// a download item, whose GUID then follows
 const SOURCE_DOWNLOAD_ITEM: u8 = 4;
-/// The embedded DLL a web installer downloads its files with
+/// The embedded file a web installer downloads its files with
 const DOWNLOAD_LIBRARY: &str = "tcpip32.dll";
 /// Each part of a multi-part installer starts with `ESIV`, the session ID,
 /// the part number and the length of the part's data
@@ -109,56 +103,6 @@ const MAX_VOLUMES: u32 = 999;
 /// A file that spans parts is gathered into one buffer, which starts no
 /// larger than this whatever size the record claims
 const MAX_SPANNED_PREALLOC: usize = 1 << 24;
-/// String found only in the Apple fork of the runtime DLL
-const APPLE_MARKER: &[u8] = b"vise32qt";
-
-/// Record layout, detected from the embedded vise32ex.dll: its ASCII version
-/// table, the string `vise32qt`, or failing both its build date
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordFmt {
-    /// Pre-4.x as of 2.6. No version table. Inline strings use u8 length
-    /// prefixes, common header lacks the flag byte between features and
-    /// conditions and the trailing byte after bitmasks, and blob offsets are
-    /// file-relative rather than payload-relative
-    Pre4,
-    /// Pre-4.x as of 2.5. Like `Pre4`, but folder, shortcut and
-    /// file-association records and the end of file records are shorter
-    Pre25,
-    /// Pre-4.x as of 2.4. Like `Pre25`, with file records two bytes
-    /// shorter again
-    Pre24,
-    #[allow(clippy::doc_markdown)]
-    /// Apple fork, internal version 2.x. Identified by
-    /// string `vise32qt` in the decompressed DLL. Install path is read
-    /// from the record stream. 33 record types (up to 0x23)
-    Apple,
-    /// Mainline up to 4.6. ASCII version table present with
-    /// first entry below 4.7. Records are laid out as in `Main4`, except
-    /// that folder records, the end of file records and package entries are
-    /// each a few bytes shorter, as they are in the Apple fork
-    Main46,
-    /// Mainline 4.7. ASCII version table present with first entry 4.7. The
-    /// install path comes from the folder records. 36 record types (up to 0x26)
-    Main4,
-    /// Mainline 4.8 and later. Common header layout widens: the four u8
-    /// fields after the first skip become u8, u16, u8, u16, and the seven
-    /// trailing u8 fields become six
-    Main48,
-}
-
-impl RecordFmt {
-    /// Whether this is one of the pre-4.x layouts. They share one-byte
-    /// string prefixes, the shorter common header and file-relative offsets
-    const fn is_pre4(self) -> bool {
-        matches!(self, Self::Pre24 | Self::Pre25 | Self::Pre4)
-    }
-
-    /// The layout used for everything the older pre-4.x revisions do not
-    /// change
-    const fn family(self) -> Self {
-        if self.is_pre4() { Self::Pre4 } else { self }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayloadKind {
@@ -256,12 +200,13 @@ impl WinEntry {
 }
 
 impl WinArchive {
-    /// Parses an installer executable, locating the VISE payload inside it.
-    /// `qdat` is the companion volume of a stub installer, if there is one
+    /// Parses an installer executable, 32-bit (PE) or 16-bit (NE), locating
+    /// the VISE payload inside it. `qdat` is the companion volume of a stub
+    /// installer, if there is one
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArchive`] if the file is not a PE executable
+    /// Returns [`Error::InvalidArchive`] if the file is not an executable
     /// carrying a VISE payload, or the record stream cannot be parsed
     pub fn from_pe(file: Vec<u8>, qdat: Option<Vec<u8>>) -> Result<Self, Error> {
         let (payload, start) = crate::pe::extract_payload(&file)?;
@@ -293,7 +238,7 @@ impl WinArchive {
 
     /// Parses a payload already cut out of its executable.
     /// `payload_file_offset` is the byte position of the payload within the
-    /// PE file, needed because Pre4 blob offsets are file-relative
+    /// PE file, which the blob offsets of the older layouts count from
     ///
     /// # Errors
     ///
@@ -690,40 +635,39 @@ impl WinArchive {
     }
 }
 
+/// Which header the payload has, and the two fields after its session ID
+fn payload_header(data: &[u8]) -> Result<(PayloadKind, u32, u32), Error> {
+    let field = |at: usize| {
+        data.get(at..at + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| Error::InvalidArchive("payload too small".into()))
+    };
+    if data.starts_with(b"SIVM") && data.get(8..12) == Some(b"ESIV") {
+        Ok((PayloadKind::Sivm, field(0x10)?, field(0x14)?))
+    } else if data.starts_with(b"ESIV") {
+        Ok((PayloadKind::Esiv, field(0x08)?, field(0x0C)?))
+    } else if data.len() < 16 {
+        Err(Error::InvalidArchive("payload too small".into()))
+    } else {
+        Err(Error::InvalidArchive("not a Windows VISE payload".into()))
+    }
+}
+
 fn parse_payload(
     data: &[u8],
     qdat: Option<&[u8]>,
     payload_file_offset: usize,
 ) -> Result<WinArchiveInfo, Error> {
-    if data.len() < 16 {
-        return Err(Error::InvalidArchive("payload too small".into()));
-    }
+    let (kind, version, flags) = payload_header(data)?;
 
-    let (kind, version, flags) =
-        if &data[..4] == b"SIVM" && data.len() >= 0x18 && &data[8..12] == b"ESIV" {
-            let v = u32::from_le_bytes(data[0x10..0x14].try_into().unwrap());
-            let f = u32::from_le_bytes(data[0x14..0x18].try_into().unwrap());
-            (PayloadKind::Sivm, v, f)
-        } else if &data[..4] == b"ESIV" {
-            let v = u32::from_le_bytes(data[0x08..0x0C].try_into().unwrap());
-            let f = u32::from_le_bytes(data[0x0C..0x10].try_into().unwrap());
-            (PayloadKind::Esiv, v, f)
-        } else {
-            return Err(Error::InvalidArchive("not a Windows VISE payload".into()));
-        };
-
-    let first_entry = find_first_entry(data)?;
+    let (first_entry, count) = find_first_entry(data)?;
     let mut entries = Vec::new();
-    let (chain_end, fmt_hint) = walk_named_chain(data, first_entry, &mut entries);
+    let chain_end = walk_named_chain(data, first_entry, count, &mut entries);
     let qdat_entries = qdat.map(parse_qdat_entries).transpose()?;
-
-    let text = main_code_page(data, chain_end);
-
-    let try_order = try_order(fmt_hint);
 
     let web = entries
         .iter()
-        .any(|dll| dll.name.eq_ignore_ascii_case(DOWNLOAD_LIBRARY));
+        .any(|file| file.name.eq_ignore_ascii_case(DOWNLOAD_LIBRARY));
     let info = |entries| WinArchiveInfo {
         version,
         flags,
@@ -731,104 +675,197 @@ fn parse_payload(
         entries,
     };
 
-    // A wrong layout or a wrong start position can still parse without an
-    // error, so every candidate is judged by what it found: how many of its
-    // files have data where the record says it is. One that reads every
-    // declared record and places every file is taken at once; failing that,
-    // the candidate that places the most files wins
-    let mut best: Option<((usize, bool, usize), Vec<WinEntry>)> = None;
+    let reading = Reading {
+        data,
+        qdat_len: qdat.map(<[u8]>::len),
+        qdat_entries: qdat_entries.as_deref(),
+        kind,
+        flags,
+        chain_end,
+        payload_file_offset,
+        embedded: &entries,
+    };
+    let mut best: Option<(Score, Vec<WinEntry>)> = None;
+    let mut keep = |found: Found, exact: bool| {
+        // most files placed, then a stream that was not searched for and
+        // read to its end, then fewest records that needed realigning: a
+        // layout that is slightly off reads the fields of a file record
+        // from the wrong place. Last, fewest files that start inside the
+        // stream, which is what reading its last record too far looks like
+        let trusted = found.complete && exact;
+        let score = (
+            found.placed,
+            trusted,
+            usize::MAX - found.realigned,
+            usize::MAX - found.overrun,
+        );
+        if best.as_ref().is_none_or(|(top, _)| score > *top) {
+            best = Some((score, found.entries));
+        }
+    };
     let mut last_err = None;
-    for &fmt in try_order {
-        // SIVM blob offsets count from past the magic and trailer-offset
-        // fields, eight bytes into the payload. ESIV ones count from the
-        // start of the payload or, in the older runtimes, from the start of
-        // the executable; which is settled below by trying a file
-        let blob_add: usize = match kind {
-            PayloadKind::Sivm => SIVM_BLOB_OFFSET,
-            PayloadKind::Esiv => 0,
+
+    // A layout whose sections lead to a record stream, every record of
+    // which then reads, is the installer's own, and is taken at once
+    let mut unread = Vec::new();
+    for layout in LAYOUTS {
+        let Some(start) = exact_stream_start(data, chain_end, layout) else {
+            unread.push(layout);
+            continue;
         };
-
-        // The stream's position comes from reading the sections in front of
-        // it. Only when those cannot be read is it searched for instead
-        let exact = exact_stream_start(data, chain_end, fmt)
-            .or_else(|| anchored_stream_start(data, chain_end, fmt));
+        match reading.read(layout, start) {
+            Ok(found) if found.fits() => {
+                debug_assert!(reading.others_agree(layout, &found, chain_end));
+                return Ok(info(found.entries));
+            }
+            Ok(found) => keep(found, true),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    // With the layouts whose sections do not lead to one, a stream is
+    // searched for. A wrong layout or a wrong position can still read
+    // without an error, so such a stream also has to place every file
+    for layout in unread {
         let mut from = chain_end;
-        for i in 0..MAX_STREAM_CANDIDATES {
-            let stream_off = match exact {
-                Some(known) if i == 0 => known,
-                Some(_) => break,
-                None => {
-                    let Ok(found) = find_record_stream(data, from, chain_end, fmt) else {
-                        break;
-                    };
-                    from = found + 1;
-                    found
-                }
+        for _ in 0..MAX_STREAM_CANDIDATES {
+            let Ok(start) = find_record_stream(data, from, chain_end, layout) else {
+                break;
             };
-
-            let mut trial = entries.clone();
-            match parse_record_stream(
-                data,
-                stream_off,
-                &StreamReading {
-                    fmt,
-                    blob_base: blob_add,
-                    flags,
-                    text,
-                    qdat_entries: qdat_entries.as_deref(),
-                },
-                &mut trial,
-            ) {
-                Ok(read) => {
-                    let complete = read.complete;
-                    if kind == PayloadKind::Esiv
-                        && offsets_count_from_file_start(
-                            data,
-                            &trial[entries.len()..],
-                            payload_file_offset,
-                            fmt,
-                        )
-                    {
-                        rebase_onto_payload(&mut trial[entries.len()..], payload_file_offset);
-                    }
-                    mark_misplaced(&mut trial[entries.len()..], read.end, data.len());
-                    let files = &trial[entries.len()..];
-                    let placed = count_placed(files, data.len(), qdat.map(<[u8]>::len));
-                    // a layout that fits the stream exactly and places every
-                    // file is taken at once
-                    if complete && read.realigned == 0 && !files.is_empty() && placed == files.len()
-                    {
-                        return Ok(info(trial));
-                    }
-                    // A stream found by reading the sections is where the
-                    // installer itself looks, so reading it to the end is
-                    // enough. One found by scanning has to place a file:
-                    // stray bytes can read as a short stream with none
-                    // Otherwise the layouts are compared: most files placed,
-                    // then fewest records that needed realigning, since a
-                    // layout that is slightly off reads the fields of a file
-                    // record from the wrong place
-                    let trusted = complete && exact.is_some();
-                    let score = (placed, trusted, usize::MAX - read.realigned);
-                    if best.as_ref().is_none_or(|(top, _)| score > *top) {
-                        best = Some((score, trial));
-                    }
+            from = start + 1;
+            match reading.read(layout, start) {
+                Ok(found) if found.fits() && found.files > 0 && found.placed == found.files => {
+                    return Ok(info(found.entries));
                 }
+                Ok(found) => keep(found, false),
                 Err(e) => last_err = Some(e),
             }
         }
     }
 
-    // A candidate that placed no file is accepted only if its stream was
-    // located exactly and read to the end. Anything less is not a reading of
-    // the stream at all, and returning it would report an installer as
-    // holding only its embedded DLLs
-    if let Some(((placed, trusted, _), entries)) = best {
+    // Failing both, the candidate that did best is used. One that placed no
+    // file is accepted only if its stream was located by its sections and
+    // read to the end. Anything less is not a reading of the stream at all,
+    // and returning it would report an installer as holding only its
+    // embedded files
+    if let Some(((placed, trusted, ..), entries)) = best {
         if trusted || placed > 0 {
             return Ok(info(entries));
         }
     }
     Err(last_err.unwrap_or_else(|| Error::InvalidArchive("record stream not found".into())))
+}
+
+/// How well a reading did, for comparing readings: see where it is made
+type Score = (usize, bool, usize, usize);
+
+/// What reading a record stream under one layout needs besides the layout
+/// and the position
+struct Reading<'a> {
+    data: &'a [u8],
+    qdat_len: Option<usize>,
+    qdat_entries: Option<&'a [(usize, usize)]>,
+    kind: PayloadKind,
+    flags: u32,
+    /// Where the embedded files end
+    chain_end: usize,
+    payload_file_offset: usize,
+    /// The embedded files, which every reading starts with, their names
+    /// one character to the byte
+    embedded: &'a [WinEntry],
+}
+
+/// What a record stream read as under one layout
+struct Found {
+    /// The embedded files, then the files of the stream
+    entries: Vec<WinEntry>,
+    files: usize,
+    /// How many of the files have data where their record says
+    placed: usize,
+    complete: bool,
+    realigned: usize,
+    /// How many of the files start before the stream ends
+    overrun: usize,
+}
+
+impl Found {
+    /// Whether every record the stream declares read, one after the other,
+    /// and the stream ended before the files. Nothing follows the last
+    /// record to show that it was read right, except that the file data
+    /// has to start after it
+    fn fits(&self) -> bool {
+        self.complete && self.realigned == 0 && self.overrun == 0
+    }
+}
+
+impl Reading<'_> {
+    /// Reads the record stream at `start` under `layout`
+    fn read(&self, layout: LayoutId, start: usize) -> Result<Found, Error> {
+        // SIVM blob offsets count from past the magic and trailer-offset
+        // fields, eight bytes into the payload. ESIV ones count from the
+        // start of the payload or from the start of the executable; which
+        // is settled below by trying a file
+        let blob_base = match self.kind {
+            PayloadKind::Sivm => SIVM_BLOB_OFFSET,
+            PayloadKind::Esiv => 0,
+        };
+        // where the language table is depends on the layout, and with it
+        // the code page of every name
+        let text = main_code_page(self.data, self.chain_end, layout);
+        let mut entries = self.embedded.to_vec();
+        for file in &mut entries {
+            if let Some(name) = sections::chain_name_bytes(&file.name) {
+                file.name = decode_windows(&name, text);
+            }
+        }
+        let read = parse_record_stream(
+            self.data,
+            start,
+            &StreamReading {
+                layout,
+                blob_base,
+                flags: self.flags,
+                text,
+                qdat_entries: self.qdat_entries,
+            },
+            &mut entries,
+        )?;
+        let files = &mut entries[self.embedded.len()..];
+        if self.kind == PayloadKind::Esiv
+            && offsets_count_from_file_start(self.data, files, self.payload_file_offset, layout)
+        {
+            rebase_onto_payload(files, self.payload_file_offset);
+        }
+        mark_misplaced(files, read.end, self.data.len());
+        let overrun = files
+            .iter()
+            .filter(|f| f.location == Location::Installer && f.compressed_len > 0)
+            .filter(|f| f.offset < read.end)
+            .count();
+        Ok(Found {
+            overrun,
+            files: files.len(),
+            placed: count_placed(files, self.data.len(), self.qdat_len),
+            entries,
+            complete: read.complete,
+            realigned: read.realigned,
+        })
+    }
+
+    /// Whether every other layout that reads the installer as `layout` does
+    /// finds the same files in it. Taking the first layout that fits rests
+    /// on this
+    fn others_agree(&self, layout: LayoutId, found: &Found, chain_end: usize) -> bool {
+        let listing = |found: &Found| format!("{:?}", found.entries);
+        let expected = listing(found);
+        LAYOUTS
+            .into_iter()
+            .filter(|&other| other != layout)
+            .all(|other| {
+                exact_stream_start(self.data, chain_end, other)
+                    .and_then(|start| self.read(other, start).ok())
+                    .is_none_or(|theirs| !theirs.fits() || listing(&theirs) == expected)
+            })
+    }
 }
 
 /// Whether the entry's data decodes at `offset` to the size and CRC its
@@ -855,12 +892,13 @@ const OFFSET_BASE_TRIES: usize = 3;
 /// that, and the point where it changed is not known, so it is decided by
 /// decoding: the smallest few files are tried at both positions, and the
 /// first one that decodes at exactly one of them settles it. If none does,
-/// the pre-4.x layouts are taken to be file-relative and the rest not
+/// it goes by the layout: one whose file records have a one-byte length on
+/// the string after the times is taken to count from the executable
 fn offsets_count_from_file_start(
     data: &[u8],
     files: &[WinEntry],
     payload_file_offset: usize,
-    fmt: RecordFmt,
+    layout: LayoutId,
 ) -> bool {
     if payload_file_offset == 0 {
         return false;
@@ -882,87 +920,13 @@ fn offsets_count_from_file_start(
             return from_file;
         }
     }
-    fmt.is_pre4()
-}
-
-/// The record layouts to try, the one the runtime DLL points to first. Each
-/// is fully specified; the rest are there in case the hint is wrong. For
-/// the pre-4.x revisions the hint is the DLL's build date, which is known to
-/// separate them only to within a couple of months, so the other two
-/// revisions come next
-fn try_order(hint: RecordFmt) -> &'static [RecordFmt] {
-    match hint {
-        RecordFmt::Pre4 => &[
-            RecordFmt::Pre4,
-            RecordFmt::Pre25,
-            RecordFmt::Pre24,
-            RecordFmt::Apple,
-            RecordFmt::Main46,
-            RecordFmt::Main4,
-            RecordFmt::Main48,
-        ],
-        RecordFmt::Pre25 => &[
-            RecordFmt::Pre25,
-            RecordFmt::Pre4,
-            RecordFmt::Pre24,
-            RecordFmt::Apple,
-            RecordFmt::Main46,
-            RecordFmt::Main4,
-            RecordFmt::Main48,
-        ],
-        RecordFmt::Pre24 => &[
-            RecordFmt::Pre24,
-            RecordFmt::Pre25,
-            RecordFmt::Pre4,
-            RecordFmt::Apple,
-            RecordFmt::Main46,
-            RecordFmt::Main4,
-            RecordFmt::Main48,
-        ],
-        RecordFmt::Apple => &[
-            RecordFmt::Apple,
-            RecordFmt::Main46,
-            RecordFmt::Main4,
-            RecordFmt::Main48,
-            RecordFmt::Pre4,
-            RecordFmt::Pre25,
-            RecordFmt::Pre24,
-        ],
-        RecordFmt::Main4 => &[
-            RecordFmt::Main4,
-            RecordFmt::Main46,
-            RecordFmt::Main48,
-            RecordFmt::Apple,
-            RecordFmt::Pre4,
-            RecordFmt::Pre25,
-            RecordFmt::Pre24,
-        ],
-        RecordFmt::Main48 => &[
-            RecordFmt::Main48,
-            RecordFmt::Main4,
-            RecordFmt::Main46,
-            RecordFmt::Apple,
-            RecordFmt::Pre4,
-            RecordFmt::Pre25,
-            RecordFmt::Pre24,
-        ],
-        RecordFmt::Main46 => &[
-            RecordFmt::Main46,
-            RecordFmt::Main4,
-            RecordFmt::Apple,
-            RecordFmt::Main48,
-            RecordFmt::Pre4,
-            RecordFmt::Pre25,
-            RecordFmt::Pre24,
-        ],
-    }
+    layout.table().file.after_times == Text::Short
 }
 
 /// How many of `files` have a name and their data inside the source they
-/// read from:
-/// the payload, or the companion volume of `qdat_len` bytes. A stub read
-/// without its volume has nothing to check those offsets against, so they
-/// count as placed
+/// read from: the payload, or the companion volume of `qdat_len` bytes. A
+/// stub read without its volume has nothing to check those offsets against,
+/// so they count as placed
 fn count_placed(files: &[WinEntry], payload_len: usize, qdat_len: Option<usize>) -> usize {
     files
         .iter()
@@ -984,11 +948,21 @@ fn count_placed(files: &[WinEntry], payload_len: usize, qdat_len: Option<usize>)
 }
 
 /// Names are stored in the ANSI code page of the installer's main language,
-/// whose ID follows the DLL chain in every runtime
-fn main_code_page(data: &[u8], chain_end: usize) -> &'static Encoding {
-    let language = chain_end
-        .checked_add(4)
-        .and_then(|end| data.get(chain_end + 2..end))
+/// whose ID the language table starts with. The table follows the two flag
+/// bytes after the embedded files, and in the layouts that have one, the
+/// block the second flag byte brings in
+fn main_code_page(data: &[u8], chain_end: usize, layout: LayoutId) -> &'static Encoding {
+    let table = match layout.table().start {
+        start @ [Op::Skip(1), Op::When(..), ..] => {
+            let mut c = Cursor::new(data, chain_end, layout);
+            grammar::step(&mut c, &start[..2], grammar::Limit::Any)
+                .ok()
+                .map(|()| c.pos)
+        }
+        _ => chain_end.checked_add(2),
+    };
+    let language = table
+        .and_then(|at| data.get(at..at.checked_add(2)?))
         .map_or(0, |id| u16::from_le_bytes([id[0], id[1]]));
     windows_code_page(language)
 }
@@ -1029,49 +1003,26 @@ fn rebase_onto_payload(files: &mut [WinEntry], payload_file_offset: usize) {
     }
 }
 
-/// Every record layout. The first four are in the order bits 0-1 of the fuzz
-/// selector byte pick them; the rest have selector bits of their own
-#[cfg(any(test, feature = "fuzzing"))]
-const ALL_FORMATS: [RecordFmt; 7] = [
-    RecordFmt::Pre4,
-    RecordFmt::Apple,
-    RecordFmt::Main4,
-    RecordFmt::Main48,
-    RecordFmt::Main46,
-    RecordFmt::Pre25,
-    RecordFmt::Pre24,
-];
-
-/// Fuzz selector bits for the layouts that bits 0-1 do not reach
-#[cfg(any(test, feature = "fuzzing"))]
-const FUZZ_SELECT: [(u8, RecordFmt); 3] = [
-    (32, RecordFmt::Main46),
-    (64, RecordFmt::Pre25),
-    (128, RecordFmt::Pre24),
-];
-
 /// Describes how each record layout fares on a payload: where the stream
 /// was found, how many records were read, the types of the last few, and
-/// the error that stopped it. For working out layouts that are not handled
-/// yet; not part of the extractor
+/// the error that stopped it. For looking into an installer that does not
+/// read; not part of the extractor
 #[cfg(feature = "fuzzing")]
 pub(crate) fn trace_layouts(data: &[u8]) -> Vec<String> {
     let mut lines = Vec::new();
-    let Ok(first_entry) = find_first_entry(data) else {
-        return vec!["no vise32ex.dll in payload".into()];
+    let Ok(chain_end) = sections::embedded_files_end(data) else {
+        return vec!["payload header is cut short".into()];
     };
-    let (chain_end, hint) = walk_named_chain(data, first_entry, &mut Vec::new());
-    lines.push(format!("chain_end={chain_end:#x} hint={hint:?}"));
-    for fmt in ALL_FORMATS {
-        let walked = skip_to_record_stream(data, chain_end, fmt);
-        let found = exact_stream_start(data, chain_end, fmt)
-            .or_else(|| anchored_stream_start(data, chain_end, fmt))
-            .or_else(|| find_record_stream(data, chain_end, chain_end, fmt).ok());
+    lines.push(format!("chain_end={chain_end:#x}"));
+    for layout in LAYOUTS {
+        let walked = skip_to_record_stream(data, chain_end, layout);
+        let found = exact_stream_start(data, chain_end, layout)
+            .or_else(|| find_record_stream(data, chain_end, chain_end, layout).ok());
         let Some(start) = found else {
-            lines.push(format!("{fmt:?}: sections {walked:x?}; no stream found"));
+            lines.push(format!("{layout:?}: sections {walked:x?}; no stream found"));
             continue;
         };
-        let mut c = Cursor::new(data, start, fmt);
+        let mut c = Cursor::new(data, start, layout);
         let count = c.u32().unwrap_or(0);
         let mut seen: Vec<(usize, u32)> = Vec::new();
         let mut error = None;
@@ -1080,13 +1031,11 @@ pub(crate) fn trace_layouts(data: &[u8]) -> Vec<String> {
             let step = (|| {
                 let rtype = c.u32()?;
                 seen.push((at, rtype));
-                c.common()?;
-                if rtype == 2 {
-                    read_file_fields(&mut c)?;
-                    skip_type2_tail(&mut c, false).map(|_| ())
-                } else {
-                    skip_type(&mut c, rtype)
+                if layout.is_bare(rtype) {
+                    return Ok(());
                 }
+                grammar::record_header(&mut c)?;
+                skip_type(&mut c, rtype)
             })();
             if let Err(e) = step {
                 error = Some(Error::from(e).to_string());
@@ -1103,20 +1052,69 @@ pub(crate) fn trace_layouts(data: &[u8]) -> Vec<String> {
         // the same stream as the extractor reads it, which steps over
         // record bodies it does not understand
         let mut files = Vec::new();
-        let read = parse_record_stream(data, start, &StreamReading::plain(fmt), &mut files);
+        let read = parse_record_stream(data, start, &StreamReading::plain(layout), &mut files);
         lines.push(format!(
-            "{fmt:?}: as read: {} files, {:?}",
+            "{layout:?}: as read: {} files, {:?}",
             files.len(),
             read.map_err(|e| e.to_string())
         ));
         lines.push(format!(
-            "{fmt:?}: sections {walked:x?}; stream {start:#x}; {}/{count} records; last {}; {}",
+            "{layout:?}: sections {walked:x?}; stream {start:#x}; {}/{count} records; last {}; {}",
             seen.len() - usize::from(error.is_some()),
             tail.join(" "),
             error.unwrap_or_else(|| "complete".into())
         ));
     }
     lines
+}
+
+/// Where the sections in front of the record stream end under the layout
+/// named `name`, and whether a record stream starts there
+#[cfg(feature = "fuzzing")]
+pub(crate) fn stream_start(data: &[u8], name: &str) -> Result<(usize, bool), Error> {
+    let layout = *LAYOUTS
+        .iter()
+        .find(|layout| format!("{layout:?}") == name)
+        .ok_or_else(|| Error::InvalidArchive("no such layout".into()))?;
+    let chain_end = sections::embedded_files_end(data)?;
+    let end = skip_to_record_stream(data, chain_end, layout)?;
+    Ok((end, sections::starts_record_stream(data, end, layout)))
+}
+
+/// Reads the record stream at `start` under the layout named `layout`,
+/// with no searching: where each record starts, its type, and the error
+/// that stopped the read if one did. For checking a layout against a
+/// reference
+#[cfg(feature = "fuzzing")]
+pub(crate) fn record_spans(
+    data: &[u8],
+    start: usize,
+    name: &str,
+) -> (Vec<(usize, u32)>, usize, Option<String>) {
+    let Some(&layout) = LAYOUTS.iter().find(|f| format!("{f:?}") == name) else {
+        return (Vec::new(), start, Some("no such layout".into()));
+    };
+    let mut c = Cursor::new(data, start, layout);
+    let mut spans = Vec::new();
+    let Ok(count) = c.u32() else {
+        return (spans, start, Some("no record count".into()));
+    };
+    for _ in 0..count.min(MAX_RECORD_COUNT) {
+        let at = c.pos;
+        let step = (|| {
+            let rtype = c.u32()?;
+            spans.push((at, rtype));
+            if layout.is_bare(rtype) {
+                return Ok(());
+            }
+            grammar::record_header(&mut c)?;
+            skip_type(&mut c, rtype)
+        })();
+        if let Err(e) = step {
+            return (spans, c.pos, Some(Error::from(e).to_string()));
+        }
+    }
+    (spans, c.pos, None)
 }
 
 /// Entries read per fuzz input, so one input cannot spend its whole run
@@ -1126,25 +1124,22 @@ const FUZZ_READ_LIMIT: usize = 64;
 
 /// Parses `data` as a record stream directly, without the header and runtime
 /// DLL that a whole payload needs first, then reads the entries it found. The
-/// first byte selects the record layout (bits 0-1, or one of bits 5-7 for the
-/// other three), stub mode (bit 2), the SIVM offset base (bit 3), and whether
-/// to treat the input as its own `.qdat` volume (bit 4); the rest is the stream
+/// first byte selects stub mode (bit 0), the SIVM offset base (bit 1),
+/// whether to treat the input as its own `.qdat` volume (bit 2) and, in its
+/// upper five bits, the record layout; the rest is the stream
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_records(data: &[u8]) {
     let Some((&selector, stream)) = data.split_first() else {
         return;
     };
-    let fmt = FUZZ_SELECT
-        .iter()
-        .find(|&&(bit, _)| selector & bit != 0)
-        .map_or(ALL_FORMATS[usize::from(selector & 3)], |&(_, fmt)| fmt);
-    let flags = if selector & 4 == 0 { 0 } else { STUB_FLAG };
-    let blob_add = if selector & 8 == 0 {
+    let layout = LAYOUTS[usize::from(selector >> 3) % LAYOUTS.len()];
+    let flags = if selector & 1 == 0 { 0 } else { STUB_FLAG };
+    let blob_add = if selector & 2 == 0 {
         0
     } else {
         SIVM_BLOB_OFFSET
     };
-    let qdat = (selector & 16 != 0).then(|| stream.to_vec());
+    let qdat = (selector & 4 != 0).then(|| stream.to_vec());
     let qdat_entries = qdat.as_deref().and_then(|q| parse_qdat_entries(q).ok());
 
     let mut entries = Vec::new();
@@ -1152,7 +1147,7 @@ pub(crate) fn fuzz_records(data: &[u8]) {
         stream,
         0,
         &StreamReading {
-            fmt,
+            layout,
             blob_base: blob_add,
             flags,
             text: encoding_rs::WINDOWS_1252,

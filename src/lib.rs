@@ -1,7 +1,7 @@
 //! Extractor for Installer VISE archives (`MindVision`, 1990s-2000s)
 //!
 //! Reads Mac archives of format versions 00 01 through 03 0e and 0b 00
-//! ([`Archive`]) and Windows installers, which are PE executables carrying
+//! ([`Archive`]) and Windows installers, which are executables carrying
 //! the archive in a `_mvdata` section or after the image ([`WinArchive`])
 //!
 //! The library never prints. [`Archive::extract`] and [`WinArchive::extract`]
@@ -94,8 +94,8 @@ pub fn mac_name_encoding(file: &[u8]) -> NameEncoding {
     macbinary::region(file).map_or(NameEncoding::MacRoman, NameEncoding::from_region)
 }
 
-/// Decompression internals re-exported for the fuzz targets under the `fuzzing`
-/// feature only, not public API
+/// Internals for the fuzz targets and for checking the parsers from outside,
+/// under the `fuzzing` feature only; not public API
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing {
@@ -131,11 +131,58 @@ pub mod fuzzing {
         }
     }
 
+    /// Reads a Mac archive's table as if its format version were not
+    /// listed, so the name offsets are worked out from the archive. For
+    /// comparing with the ordinary read
+    ///
+    /// # Errors
+    ///
+    /// Returns what the ordinary read would
+    pub fn mac_parse_unlisted(
+        data: &[u8],
+        encoding: super::NameEncoding,
+    ) -> Result<crate::mac::ArchiveInfo, super::Error> {
+        crate::mac::parse_as(data, encoding, false)
+    }
+
     /// Parses the input as a Windows record stream, skipping the header and
     /// runtime DLL a whole payload needs first, and reads the entries found.
     /// The first byte selects the record layout and offset handling
     pub fn parse_win_records(data: &[u8]) {
         crate::win::fuzz_records(data);
+    }
+
+    /// For checking a layout table against an installer, outside the
+    /// parser's own choice of layout.
+    ///
+    /// Where the sections in front of the record stream end in an
+    /// installer's payload under one named layout, and whether a record
+    /// stream starts there
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped the read
+    pub fn win_stream_start(file: &[u8], layout: &str) -> Result<(usize, bool), crate::Error> {
+        let (payload, _) = crate::pe::extract_payload(file)?;
+        crate::win::stream_start(payload, layout)
+    }
+
+    /// For checking a layout table against an installer: the positions can
+    /// be compared with ones known some other way.
+    ///
+    /// Reads the record stream at `start` in an installer's payload under
+    /// one named layout, without searching: each record's position and type,
+    /// where the read ended, and the error that stopped it
+    #[must_use]
+    pub fn win_record_spans(
+        file: &[u8],
+        start: usize,
+        layout: &str,
+    ) -> (Vec<(usize, u32)>, usize, Option<String>) {
+        match crate::pe::extract_payload(file) {
+            Ok((payload, _)) => crate::win::record_spans(payload, start, layout),
+            Err(e) => (Vec::new(), start, Some(e.to_string())),
+        }
     }
 
     /// Reports how each Windows record layout fares on an installer, for
@@ -1708,10 +1755,13 @@ mod tests {
         assert_eq!(fs::read(tmp.path().join("Payload")).unwrap(), payload);
     }
 
-    /// A file record as the Mac OS X installers lay it out: two more bytes
-    /// of fields before the name length
-    fn osx_record(mut record: Vec<u8>, name_len_at: usize) -> Vec<u8> {
+    /// A record as the Mac OS X installers lay it out: two more bytes of
+    /// fields before the name length, and the name moved from `name_at.0`
+    /// to `name_at.1`
+    fn osx_record(mut record: Vec<u8>, name_len_at: usize, name_at: (usize, usize)) -> Vec<u8> {
         record.splice(name_len_at..name_len_at, [0, 0]);
+        let (from, to) = (name_at.0 + 2, name_at.1);
+        record.splice(from..from, vec![0; to - from]);
         record
     }
 
@@ -1731,13 +1781,14 @@ mod tests {
             ..TestFile::default()
         };
         // name length sits at 80 in a folder record and 122 in a file record
-        let mut records = osx_record(dvct_record("Contents", 0), 80);
-        records.extend(osx_record(fvct_record(&file), 122));
+        let mut records = osx_record(dvct_record("Contents", 0), 80, (88, 178));
+        records.extend(osx_record(fvct_record(&file), 122, (124, 212)));
 
         // the table file is the installer program: header, program, table
         let program = vec![0xC3u8; 4000];
         let mut table = archive_from_records(1, &program, &records);
         table[0x12] = 0x0b;
+        table[0x13] = 0;
         table[0x08..0x0c].copy_from_slice(&len(&program).to_be_bytes());
         // the data file is a header and the file data
         let mut data_file = table[..SEGMENT_DATA_START].to_vec();
@@ -1774,6 +1825,7 @@ mod tests {
         // an installer that keeps both in one file needs nothing else
         let mut single = archive_from_records(1, &blob, &records);
         single[0x12] = 0x0b;
+        single[0x13] = 0;
         let single = Archive::parse(single).unwrap();
         assert_eq!(
             single.read(single.files().next().unwrap()).unwrap().data,

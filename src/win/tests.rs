@@ -8,17 +8,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-#[test]
-fn detects_each_runtime_from_its_dll() {
-    assert_eq!(
-        detect_record_fmt(b"..\x00vise32qt.dll\x00.."),
-        RecordFmt::Apple
-    );
-    assert_eq!(detect_record_fmt(b"..\x004.7.0.2\x00.."), RecordFmt::Main4);
-    assert_eq!(detect_record_fmt(b"..\x004.6.2.0\x00.."), RecordFmt::Main46);
-    assert_eq!(detect_record_fmt(b"..\x004.9.0.0\x00.."), RecordFmt::Main48);
-    assert_eq!(detect_record_fmt(b"no markers here"), RecordFmt::Pre4);
-}
+/// The newest layout, for a test that needs one layout and not all
+const NEWEST: LayoutId = LAYOUTS[0];
+/// The oldest layout. It keeps a folder with each file
+const OLDEST: LayoutId = LAYOUTS[LAYOUTS.len() - 1];
 
 #[test]
 fn read_checks_range_size_and_qdat() {
@@ -197,12 +190,12 @@ fn multi_part_installer_reads_across_its_parts() {
 
 #[test]
 fn parses_and_reads_each_runtime_variant() {
-    for fmt in ALL_FORMATS {
-        let archive = WinArchive::parse(testutil::payload(fmt, 0), None, 0)
-            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(fmt)));
+    for layout in LAYOUTS {
+        let archive = WinArchive::parse(testutil::payload(layout, 0), None, 0)
+            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(layout)));
         let entries = &archive.info.entries;
         let paths: Vec<String> = entries.iter().map(WinEntry::path).collect();
-        let dir = testutil::directory(fmt);
+        let dir = testutil::directory(layout);
         let in_dir = |name: &str| {
             if dir.is_empty() {
                 name.to_string()
@@ -218,10 +211,10 @@ fn parses_and_reads_each_runtime_variant() {
                 in_dir("empty.dat")
             ],
             "{}",
-            testutil::label(fmt)
+            testutil::label(layout)
         );
 
-        assert_eq!(archive.read(&entries[0]).unwrap(), testutil::fake_dll(fmt));
+        assert_eq!(archive.read(&entries[0]).unwrap(), testutil::fake_dll());
         assert_eq!(archive.read(&entries[1]).unwrap(), testutil::HELLO);
         assert_eq!(entries[1].uncompressed_len, testutil::HELLO.len());
         assert_eq!(archive.read(&entries[2]).unwrap(), b"");
@@ -229,80 +222,258 @@ fn parses_and_reads_each_runtime_variant() {
 }
 
 #[test]
+fn a_payload_under_an_sivm_header_reads_under_every_layout() {
+    for layout in LAYOUTS {
+        let archive = WinArchive::parse(testutil::sivm_payload(layout), None, 0)
+            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(layout)));
+        let entries = &archive.info.entries;
+        assert_eq!(entries.len(), 3, "{}", testutil::label(layout));
+        assert_eq!(archive.read(&entries[0]).unwrap(), testutil::fake_dll());
+        assert_eq!(archive.read(&entries[1]).unwrap(), testutil::HELLO);
+    }
+}
+
+#[test]
+fn a_record_type_with_nothing_after_its_number_is_stepped_over() {
+    for layout in LAYOUTS {
+        let label = testutil::label(layout);
+        let file = |name: &str, id| {
+            testutil::with_ids(testutil::file_record(layout, name, 0, 0, 0), id, 0)
+        };
+        let bare = layout.table().bare;
+        assert!(!bare.is_empty(), "{label}");
+        let count = u32::try_from(bare.len()).unwrap() + 2;
+        let mut stream = count.to_le_bytes().to_vec();
+        stream.extend(file("first.dat", 0x401));
+        for rtype in bare {
+            stream.extend(rtype.to_le_bytes());
+        }
+        stream.extend(file("last.dat", 0x402));
+        let (read, entries) = parse_stream(&stream, layout);
+        assert!(read.complete, "{label}");
+        assert_eq!(read.realigned, 0, "{label}");
+        assert_eq!(entries.len(), 2, "{label}");
+    }
+}
+
+#[test]
+fn embedded_files_are_counted_not_guessed() {
+    let file = |name: &[u8]| {
+        let mut out = vec![u8::try_from(name.len()).unwrap()];
+        out.extend_from_slice(name);
+        out.extend([0; 12]);
+        out.extend(3u32.to_le_bytes());
+        out.extend(b"xyz");
+        out
+    };
+    // two files are declared. What follows them would pass for a third
+    let mut data = 2u16.to_le_bytes().to_vec();
+    data.extend(file(b"vise32ex.dll"));
+    data.extend(file(b"ESPA\xD1OL.VLG"));
+    let end = data.len();
+    data.extend(file(b"other.dll"));
+
+    let mut entries = Vec::new();
+    // the fixed fields, an empty string, a byte and an empty string that
+    // ends with a zero, then the count
+    let header = [&b"ESIV"[..], &[0; 15]].concat();
+    assert_eq!(
+        find_first_entry(&[&header[..], &data[..]].concat()).unwrap(),
+        (header.len() + 2, 2)
+    );
+    assert_eq!(walk_named_chain(&data, 2, 2, &mut entries), end);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(sections::chain_name_bytes(&entries[0].name), None);
+    // a name outside ASCII comes back as the bytes it was stored as
+    assert_eq!(
+        sections::chain_name_bytes(&entries[1].name).as_deref(),
+        Some(&b"ESPA\xD1OL.VLG"[..])
+    );
+
+    // a file that runs past the data ends the walk where it starts
+    let cut = &data[..end - 1];
+    let mut entries = Vec::new();
+    assert_eq!(
+        walk_named_chain(cut, 2, 2, &mut entries),
+        2 + file(b"vise32ex.dll").len()
+    );
+    assert_eq!(entries.len(), 1);
+
+    // a file with nothing stored is stepped over like any other
+    let mut hollow = vec![5];
+    hollow.extend_from_slice(b"a.txt");
+    hollow.extend([0; 16]);
+    let after = hollow.len();
+    hollow.extend(file(b"b.dll"));
+    let mut entries = Vec::new();
+    assert_eq!(walk_named_chain(&hollow, 0, 2, &mut entries), hollow.len());
+    assert_eq!(
+        (entries[0].compressed_len, entries[1].offset),
+        (0, after + 1 + 5 + 16)
+    );
+}
+
+#[test]
+fn the_code_page_is_read_past_the_block_a_flag_brings_in() {
+    // Japanese as the main language
+    let language = 0x0411u16.to_le_bytes();
+    for layout in LAYOUTS {
+        let label = testutil::label(layout);
+        // the two flag bytes clear: the language table follows them
+        let plain = [&[0, 0][..], &language].concat();
+        assert_eq!(
+            main_code_page(&plain, 0, layout),
+            encoding_rs::SHIFT_JIS,
+            "{label}"
+        );
+        // the second flag byte set. Where a layout has a block for it, the
+        // block is in front of the table: of zeros, it reads as empty
+        let [Op::Skip(1), Op::When(..), ..] = layout.table().start else {
+            continue;
+        };
+        let mut c = Cursor::new(&[0; 256], 2, layout);
+        let Some(Op::When(_, block)) = layout.table().start.get(1) else {
+            unreachable!()
+        };
+        grammar::step(&mut c, block, grammar::Limit::Any).unwrap();
+        let with_block = [&[0, 1][..], &vec![0; c.pos - 2], &language].concat();
+        assert_eq!(
+            main_code_page(&with_block, 0, layout),
+            encoding_rs::SHIFT_JIS,
+            "{label}"
+        );
+        assert!(c.pos > 2, "{label}");
+    }
+}
+
+#[test]
+fn a_layout_that_reads_the_last_record_into_the_files_is_not_taken() {
+    // nothing follows the last record to show where it ends. A newer
+    // layout with a longer record of the same type reads on into the file
+    // data, and would leave the file marked as misplaced
+    for layout in LAYOUTS {
+        for rtype in 3..=layout.table().bodies.len() {
+            if layout.is_bare(u32::try_from(rtype).unwrap()) {
+                continue;
+            }
+            let label = format!("{} ending with type {rtype}", testutil::label(layout));
+            let bytes = testutil::payload_ending_with(layout, rtype);
+            let archive =
+                WinArchive::parse(bytes, None, 0).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let entries = &archive.info.entries;
+            assert_eq!(entries.len(), 2, "{label}");
+            assert!(!entries[1].misplaced, "{label}");
+            assert_eq!(
+                archive.read(&entries[1]).unwrap(),
+                testutil::HELLO,
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_last_record_that_does_not_read_is_counted() {
+    for layout in LAYOUTS {
+        let label = testutil::label(layout);
+        let mut stream = 1u32.to_le_bytes().to_vec();
+        stream.extend(testutil::empty_record(layout, 3));
+        let read = |stream: &[u8]| {
+            parse_record_stream(stream, 0, &StreamReading::plain(layout), &mut Vec::new()).unwrap()
+        };
+        assert_eq!(read(&stream).realigned, 0, "{label}");
+        // the same record with its last byte missing
+        stream.pop();
+        assert_eq!(read(&stream).realigned, 1, "{label}");
+    }
+}
+
+#[test]
+fn a_stream_can_start_with_a_type_that_has_nothing_after_its_number() {
+    for layout in LAYOUTS {
+        let Some(&bare) = layout.table().bare.first() else {
+            continue;
+        };
+        let mut stream = 2u32.to_le_bytes().to_vec();
+        stream.extend(bare.to_le_bytes());
+        // a count and such a type with no record after them are no stream
+        assert!(!starts_record_stream(&stream, 0, layout));
+        stream.extend(testutil::empty_record(layout, 1));
+        assert!(
+            starts_record_stream(&stream, 0, layout),
+            "{}",
+            testutil::label(layout)
+        );
+    }
+}
+
+#[test]
 fn pre4_offsets_are_measured_from_the_file_start() {
     let at = 0x4000;
-    let archive = WinArchive::parse(testutil::payload(RecordFmt::Pre4, at), None, at).unwrap();
+    let archive = WinArchive::parse(testutil::payload(OLDEST, at), None, at).unwrap();
     assert_eq!(
         archive.read(&archive.info.entries[1]).unwrap(),
         testutil::HELLO
     );
     // the same payload read as if it sat at offset 0 points past its data
-    let wrong = WinArchive::parse(testutil::payload(RecordFmt::Pre4, at), None, 0).unwrap();
+    let wrong = WinArchive::parse(testutil::payload(OLDEST, at), None, 0).unwrap();
     assert!(wrong.read(&wrong.info.entries[1]).is_err());
 }
 
 #[test]
 fn extracts_a_synthetic_installer_to_disk() {
-    let fmt = RecordFmt::Apple;
-    let archive = WinArchive::parse(testutil::payload(fmt, 0), None, 0).unwrap();
+    let layout = OLDEST;
+    let archive = WinArchive::parse(testutil::payload(layout, 0), None, 0).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let result = archive.extract(tmp.path()).unwrap();
     assert_eq!(result.extracted, 3);
     assert_eq!(result.failed, 0);
 
-    let docs = tmp.path().join(testutil::directory(fmt));
+    let docs = tmp.path().join(testutil::directory(layout));
     assert_eq!(fs::read(docs.join("hello.txt")).unwrap(), testutil::HELLO);
     assert_eq!(fs::read(docs.join("empty.dat")).unwrap(), b"");
     assert_eq!(
         fs::read(tmp.path().join("vise32ex.dll")).unwrap(),
-        testutil::fake_dll(fmt)
+        testutil::fake_dll()
     );
 }
 
 #[test]
 fn folder_records_give_files_their_install_path() {
-    for fmt in ALL_FORMATS {
-        let stream = testutil::tree_stream(fmt);
+    for layout in LAYOUTS {
+        let stream = testutil::tree_stream(layout);
         let mut entries = Vec::new();
-        let read = parse_record_stream(&stream, 0, &StreamReading::plain(fmt), &mut entries)
-            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(fmt)));
+        let read = parse_record_stream(&stream, 0, &StreamReading::plain(layout), &mut entries)
+            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(layout)));
         assert!(
             read.complete && read.realigned == 0,
             "{}",
-            testutil::label(fmt)
+            testutil::label(layout)
         );
         let paths: Vec<String> = entries.iter().map(WinEntry::path).collect();
-        let expected: [&str; 3] = match fmt {
-            // these layouts store a path with each file, which wins
-            RecordFmt::Pre4 | RecordFmt::Pre25 | RecordFmt::Pre24 | RecordFmt::Apple => [
+        // a layout that stores a folder with each file uses that; otherwise
+        // the folder records give it, and a separator inside a folder name
+        // does not split it
+        let expected: [&str; 3] = if testutil::directory(layout).is_empty() {
+            ["Outer/outer.txt", "Outer/In_ner/inner.txt", "top.txt"]
+        } else {
+            [
                 "TargetDir/docs/outer.txt",
                 "TargetDir/docs/inner.txt",
                 "TargetDir/docs/top.txt",
-            ],
-            // a separator inside a folder name does not split it
-            RecordFmt::Main46 | RecordFmt::Main4 | RecordFmt::Main48 => {
-                ["Outer/outer.txt", "Outer/In_ner/inner.txt", "top.txt"]
-            }
+            ]
         };
-        assert_eq!(paths, expected, "{}", testutil::label(fmt));
+        assert_eq!(paths, expected, "{}", testutil::label(layout));
     }
 }
 
-/// Layouts whose sections before the stream are read through
-const SECTIONED: [RecordFmt; 4] = [
-    RecordFmt::Apple,
-    RecordFmt::Main46,
-    RecordFmt::Main4,
-    RecordFmt::Main48,
-];
-
 #[test]
 fn stream_is_found_by_reading_the_sections_before_it() {
-    for fmt in SECTIONED {
-        let label = testutil::label(fmt);
+    for layout in LAYOUTS {
+        let label = testutil::label(layout);
         // a support file larger than the distance the fallback scan covers
-        let gap = testutil::sections(fmt, 0x50000);
-        let bytes = testutil::payload_with_gap(fmt, 0, &gap);
+        let gap = testutil::sections(layout, 0x50000);
+        let bytes = testutil::payload_with_gap(layout, 0, &gap);
         let archive =
             WinArchive::parse(bytes.clone(), None, 0).unwrap_or_else(|e| panic!("{label}: {e}"));
         let names: Vec<&str> = archive
@@ -318,10 +489,9 @@ fn stream_is_found_by_reading_the_sections_before_it() {
         );
 
         // exactly one position, right after the sections
-        let first = find_first_entry(&bytes).unwrap();
-        let (chain_end, _) = walk_named_chain(&bytes, first, &mut Vec::new());
+        let chain_end = sections::embedded_files_end(&bytes).unwrap();
         assert_eq!(
-            exact_stream_start(&bytes, chain_end, fmt),
+            exact_stream_start(&bytes, chain_end, layout),
             Some(chain_end + gap.len()),
             "{label}"
         );
@@ -330,15 +500,17 @@ fn stream_is_found_by_reading_the_sections_before_it() {
 
 #[test]
 fn sections_that_are_not_understood_fall_back_to_the_scan() {
-    for fmt in SECTIONED {
-        let label = testutil::label(fmt);
-        let mut gap = testutil::sections(fmt, 64);
-        // a first field that is not zero is not understood
-        gap[0] = 1;
-        let bytes = testutil::payload_with_gap(fmt, 0, &gap);
-        let first = find_first_entry(&bytes).unwrap();
-        let (chain_end, _) = walk_named_chain(&bytes, first, &mut Vec::new());
-        assert_eq!(exact_stream_start(&bytes, chain_end, fmt), None, "{label}");
+    for layout in LAYOUTS {
+        let label = testutil::label(layout);
+        // nothing a layout could read: every length in it runs past the end
+        let gap = [0xFF; 64];
+        let bytes = testutil::payload_with_gap(layout, 0, &gap);
+        let chain_end = sections::embedded_files_end(&bytes).unwrap();
+        assert_eq!(
+            exact_stream_start(&bytes, chain_end, layout),
+            None,
+            "{label}"
+        );
 
         let archive = WinArchive::parse(bytes, None, 0).unwrap_or_else(|e| panic!("{label}: {e}"));
         assert_eq!(archive.info.entries.len(), 3, "{label}");
@@ -351,11 +523,11 @@ fn sections_that_are_not_understood_fall_back_to_the_scan() {
 
 #[test]
 fn truncated_sections_are_an_error_not_a_panic() {
-    for fmt in SECTIONED {
-        let gap = testutil::sections(fmt, 64);
+    for layout in LAYOUTS {
+        let gap = testutil::sections(layout, 64);
         for len in 0..gap.len() {
             // every prefix either errors or stops somewhere in range
-            if let Ok(end) = skip_to_record_stream(&gap[..len], 0, fmt) {
+            if let Ok(end) = skip_to_record_stream(&gap[..len], 0, layout) {
                 assert!(end <= len);
             }
         }
@@ -364,7 +536,7 @@ fn truncated_sections_are_an_error_not_a_panic() {
 
 #[test]
 fn read_checks_the_recorded_crc() {
-    let bytes = testutil::payload(RecordFmt::Main4, 0);
+    let bytes = testutil::payload(NEWEST, 0);
     let archive = WinArchive::parse(bytes, None, 0).unwrap();
     let mut entry = archive.info.entries[1].clone();
     assert_ne!(entry.crc32, 0);
@@ -382,7 +554,7 @@ fn read_checks_the_recorded_crc() {
 
 #[test]
 fn read_tells_downloaded_files_from_damaged_ones() {
-    let bytes = testutil::payload(RecordFmt::Main4, 0);
+    let bytes = testutil::payload(NEWEST, 0);
     let mut archive = WinArchive::parse(bytes, None, 0).unwrap();
     let entry = archive.info.entries[1].clone();
     assert_eq!(archive.read(&entry).unwrap(), testutil::HELLO);
@@ -418,21 +590,21 @@ fn read_tells_downloaded_files_from_damaged_ones() {
 
 #[test]
 fn record_search_is_charged_for_all_it_scans() {
-    let fmt = RecordFmt::Main4;
+    let layout = NEWEST;
     // a candidate whose parent was never seen, then nothing: the search
     // goes on past it looking for a better one, and that is not free
-    let mut data = testutil::with_ids(testutil::folder_record(fmt, "Stray"), 0x500, 0x7777);
+    let mut data = testutil::with_ids(testutil::folder_record(layout, "Stray"), 0x500, 0x7777);
     data.resize(data.len() + 2 * PARENT_LOOKAHEAD, 0);
     let mut budget = 10 * PARENT_LOOKAHEAD;
     assert_eq!(
-        find_next_record(&data, 0, fmt, &HashSet::new(), &mut budget),
+        find_next_record(&data, 0, layout, &HashSet::new(), &mut budget),
         Some(0)
     );
     assert!(budget <= 9 * PARENT_LOOKAHEAD);
     // and a budget that runs out ends the search
     let mut budget = PARENT_LOOKAHEAD / 2;
     assert_eq!(
-        find_next_record(&data, 0, fmt, &HashSet::new(), &mut budget),
+        find_next_record(&data, 0, layout, &HashSet::new(), &mut budget),
         None
     );
 }
@@ -501,7 +673,7 @@ fn misplaced_files_are_marked() {
 
 #[test]
 fn a_wrong_recorded_size_is_overruled_by_the_checksum() {
-    let bytes = testutil::payload(RecordFmt::Main4, 0);
+    let bytes = testutil::payload(NEWEST, 0);
     let archive = WinArchive::parse(bytes, None, 0).unwrap();
     let mut entry = archive.info.entries[1].clone();
     assert_ne!(entry.crc32, 0);
@@ -514,29 +686,30 @@ fn a_wrong_recorded_size_is_overruled_by_the_checksum() {
     assert!(matches!(archive.read(&entry), Err(Error::Decompression(_))));
 }
 
-fn parse_stream(stream: &[u8], fmt: RecordFmt) -> (StreamRead, Vec<WinEntry>) {
+fn parse_stream(stream: &[u8], layout: LayoutId) -> (StreamRead, Vec<WinEntry>) {
     let mut entries = Vec::new();
-    let read = parse_record_stream(stream, 0, &StreamReading::plain(fmt), &mut entries).unwrap();
+    let read = parse_record_stream(stream, 0, &StreamReading::plain(layout), &mut entries).unwrap();
     (read, entries)
 }
 
 #[test]
 fn file_record_tail_names_a_download_item() {
-    let fmt = RecordFmt::Main46;
+    let layout = NEWEST;
     let file =
-        |name: &str, id| testutil::with_ids(testutil::file_record(fmt, name, 0, 0, 0), id, 0);
-    // the tail ends: source byte, an empty string, one byte, nine bytes.
-    // A download item puts its GUID in front of the nine
-    let mut item = file("fetched.dat", 0x401);
-    let end = item.len();
-    item[end - 13] = SOURCE_DOWNLOAD_ITEM;
-    item.splice(end - 9..end - 9, [0xAB; 16]);
+        |name: &str, id| testutil::with_ids(testutil::file_record(layout, name, 0, 0, 0), id, 0);
+    // after the source byte come an empty string and one byte. A download
+    // item has a 16-byte ID after those
+    let (item, offsets) = testutil::file_record_with_offsets(layout, "fetched.dat", 0, 0, 0);
+    let mut item = testutil::with_ids(item, 0x401, 0);
+    let source = offsets.source.unwrap();
+    item[source] = SOURCE_DOWNLOAD_ITEM;
+    item.splice(source + 4..source + 4, [0xAB; 16]);
 
     let mut stream = 3u32.to_le_bytes().to_vec();
     stream.extend(file("carried.dat", 0x402));
     stream.extend(item);
     stream.extend(file("last.dat", 0x403));
-    let (read, entries) = parse_stream(&stream, fmt);
+    let (read, entries) = parse_stream(&stream, layout);
     assert!(read.complete);
     assert_eq!(read.realigned, 0);
     let downloaded: Vec<bool> = entries
@@ -547,30 +720,10 @@ fn file_record_tail_names_a_download_item() {
 }
 
 #[test]
-fn file_records_that_end_early_are_read_in_step() {
-    // builds before the stored-data checksum was added end the record
-    // four bytes sooner
-    let fmt = RecordFmt::Main46;
-    let mut stream = 3u32.to_le_bytes().to_vec();
-    for (id, name) in (0x410..).zip(["a.dat", "b.dat", "c.dat"]) {
-        let mut record = testutil::with_ids(testutil::file_record(fmt, name, 0, 0, 0), id, 0);
-        record.truncate(record.len() - 4);
-        stream.extend(record);
-    }
-    // whatever follows the stream is not part of the last record
-    stream.extend_from_slice(&[0xEE; 64]);
-    let (read, entries) = parse_stream(&stream, fmt);
-    assert!(read.complete);
-    assert_eq!(read.realigned, 0);
-    assert_eq!(entries.len(), 3);
-    assert!(entries.iter().all(|e| e.location == Location::Installer));
-}
-
-#[test]
 fn next_record_search_prefers_a_known_parent() {
-    let fmt = RecordFmt::Main4;
+    let layout = NEWEST;
     let folder =
-        |name, id, parent| testutil::with_ids(testutil::folder_record(fmt, name), id, parent);
+        |name, id, parent| testutil::with_ids(testutil::folder_record(layout, name), id, parent);
     // bytes that read as a record whose parent was never seen, then a
     // record at the top level
     let stray = folder("Stray", 0x500, 0x7777);
@@ -578,15 +731,18 @@ fn next_record_search_prefers_a_known_parent() {
     let mut budget = usize::MAX;
     let none_seen = HashSet::new();
     assert_eq!(
-        find_next_record(&data, 0, fmt, &none_seen, &mut budget),
+        find_next_record(&data, 0, layout, &none_seen, &mut budget),
         Some(stray.len())
     );
     // once that parent has been read, the first one is a record
     let seen = HashSet::from([0x7777]);
-    assert_eq!(find_next_record(&data, 0, fmt, &seen, &mut budget), Some(0));
+    assert_eq!(
+        find_next_record(&data, 0, layout, &seen, &mut budget),
+        Some(0)
+    );
     // with nothing better close by, the first candidate stands
     assert_eq!(
-        find_next_record(&stray, 0, fmt, &none_seen, &mut budget),
+        find_next_record(&stray, 0, layout, &none_seen, &mut budget),
         Some(0)
     );
 }
@@ -594,7 +750,7 @@ fn next_record_search_prefers_a_known_parent() {
 #[test]
 fn unreadable_record_stream_is_an_error() {
     // a readable payload, for comparison
-    let good = testutil::payload(RecordFmt::Main4, 0);
+    let good = testutil::payload(NEWEST, 0);
     assert_eq!(
         WinArchive::parse(good.clone(), None, 0)
             .unwrap()
@@ -606,55 +762,16 @@ fn unreadable_record_stream_is_an_error() {
 
     // the same payload with the second record's type made one that does
     // not exist. No layout reads past it, and no file is placed, so the
-    // installer is not reported as holding just its embedded DLL
-    let first = find_first_entry(&good).unwrap();
-    let (chain_end, _) = walk_named_chain(&good, first, &mut Vec::new());
-    let stream = chain_end + 1;
-    let first_record = testutil::file_record_len(RecordFmt::Main4, "hello.txt");
+    // installer is not reported as holding just its embedded file
+    let chain_end = sections::embedded_files_end(&good).unwrap();
+    let stream = chain_end + testutil::empty_sections(NEWEST).len();
+    let first_record = testutil::file_record_len(NEWEST, "hello.txt");
     let mut bad = good;
     // make the first file unplaceable too, so nothing redeems the parse
     let second_type = stream + 4 + first_record;
     bad[second_type..second_type + 4].copy_from_slice(&0xEEu32.to_le_bytes());
     bad[stream + 4..stream + 8].copy_from_slice(&0xEEu32.to_le_bytes());
     assert!(WinArchive::parse(bad, None, 0).is_err());
-}
-
-#[test]
-fn pre4_layout_follows_the_runtime_build_date() {
-    // a PE image reduced to what the detection reads
-    let dll_built = |timestamp: u32| {
-        let mut dll = vec![0u8; 0x80];
-        dll[..2].copy_from_slice(b"MZ");
-        dll[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
-        dll[0x40..0x44].copy_from_slice(b"PE\0\0");
-        dll[0x48..0x4C].copy_from_slice(&timestamp.to_le_bytes());
-        dll
-    };
-    // build dates of 2.4.3, 2.4.5, 2.5 and 2.6.2
-    assert_eq!(detect_record_fmt(&dll_built(872_640_000)), RecordFmt::Pre24);
-    assert_eq!(
-        detect_record_fmt(&dll_built(PRE24_LAST_SEEN)),
-        RecordFmt::Pre24
-    );
-    assert_eq!(
-        detect_record_fmt(&dll_built(PRE25_FIRST_SEEN)),
-        RecordFmt::Pre25
-    );
-    assert_eq!(
-        detect_record_fmt(&dll_built(PRE4_FIRST_SEEN)),
-        RecordFmt::Pre4
-    );
-    // later than any known build stays with the newest pre-4.x layout
-    assert_eq!(detect_record_fmt(&dll_built(900_000_000)), RecordFmt::Pre4);
-    // not a PE image: no date, so the newest layout is tried first
-    assert_eq!(pe_timestamp(b"MZ but nothing more"), None);
-    assert_eq!(detect_record_fmt(&[0u8; 0x80]), RecordFmt::Pre4);
-    // whatever the hint, all three pre-4.x layouts lead the order
-    for hint in [RecordFmt::Pre24, RecordFmt::Pre25, RecordFmt::Pre4] {
-        let order = try_order(hint);
-        assert_eq!(order[0], hint);
-        assert!(order[..3].iter().all(|f| f.is_pre4()));
-    }
 }
 
 /// A u16-prefixed string
@@ -665,71 +782,13 @@ fn s16(text: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn screen_records_are_skipped_by_subtype() {
-    // a dialog with one control of each kind: caption, button, bitmap, text
-    let mut dialog = SCREEN_DIALOG.to_le_bytes().to_vec();
-    dialog.extend_from_slice(&[0; 6]);
-    dialog.extend_from_slice(&0x1d3u16.to_le_bytes());
-    dialog.extend_from_slice(&4u16.to_le_bytes());
-    for (kind, text, extra) in [
-        (1u16, &b"Requirements"[..], 0usize),
-        (2, b"Cancel", 11),
-        (8, b"default.bmp", 0),
-        (3, &[b't'; 400], 5),
-    ] {
-        dialog.extend_from_slice(&kind.to_le_bytes());
-        dialog.extend(s16(text));
-        dialog.extend_from_slice(&[0x11; 9]);
-        dialog.resize(dialog.len() + extra, 0);
-    }
-
-    let mut destination = SCREEN_DESTINATION.to_le_bytes().to_vec();
-    destination.extend_from_slice(&[1, 0]);
-    destination.extend(s16(b"default.bmp"));
-    destination.push(0);
-    destination.extend(s16(b""));
-    destination.push(0);
-    destination.extend(s16(b"%ProgramFilesDir%\\Example"));
-    destination.extend(s16(b""));
-    destination.extend(s16(b"TargetDir"));
-
-    for body in [&dialog, &destination] {
-        for fmt in [RecordFmt::Main46, RecordFmt::Main4, RecordFmt::Main48] {
-            let mut c = Cursor::new(body, 0, fmt);
-            skip_screen(&mut c).unwrap();
-            assert_eq!(c.pos, body.len(), "{fmt:?}");
-        }
-    }
-
-    // an unknown control kind is not guessed at. Before 4.8 the record is then
-    // taken to be the subtype alone
-    let mut unknown = dialog.clone();
-    unknown[14] = 0x55;
-    let mut c = Cursor::new(&unknown, 0, RecordFmt::Main48);
-    assert!(skip_screen(&mut c).is_err());
-    let mut c = Cursor::new(&unknown, 0, RecordFmt::Main4);
-    skip_screen(&mut c).unwrap();
-    assert_eq!(c.pos, 4);
-}
-
-#[test]
 fn message_text_longer_than_a_path_is_accepted() {
-    let mut c = Cursor::new(&[0u8; 0], 0, RecordFmt::Main4);
+    let mut c = Cursor::new(&[0u8; 0], 0, NEWEST);
     assert!(c.string().is_err());
     let long = s16(&[b'm'; 340]);
-    assert_eq!(
-        Cursor::new(&long, 0, RecordFmt::Main4)
-            .string()
-            .unwrap()
-            .len(),
-        340
-    );
+    assert_eq!(Cursor::new(&long, 0, NEWEST).string().unwrap().len(), 340);
     let too_long = s16(&vec![b'm'; usize::from(MAX_STRING_LEN) + 1]);
-    assert!(
-        Cursor::new(&too_long, 0, RecordFmt::Main4)
-            .string()
-            .is_err()
-    );
+    assert!(Cursor::new(&too_long, 0, NEWEST).string().is_err());
 }
 
 #[test]
@@ -744,12 +803,13 @@ fn folder_links_that_loop_end() {
 
 #[test]
 fn a_stream_cut_short_is_reported_incomplete() {
-    let fmt = RecordFmt::Main4;
-    let mut stream = testutil::tree_stream(fmt);
+    let layout = NEWEST;
+    let mut stream = testutil::tree_stream(layout);
     // claim one more record than the stream holds
     stream[..4].copy_from_slice(&6u32.to_le_bytes());
     let mut entries = Vec::new();
-    let read = parse_record_stream(&stream, 0, &StreamReading::plain(fmt), &mut entries).unwrap();
+    let read =
+        parse_record_stream(&stream, 0, &StreamReading::plain(layout), &mut entries).unwrap();
     assert!(!read.complete);
     assert_eq!(entries.len(), 3);
 }
@@ -767,31 +827,15 @@ fn filetime_counts_from_1601() {
 }
 
 #[test]
-fn version_table_entry_must_be_a_whole_version_string() {
-    // text that merely starts with "4." is not the table
-    assert_eq!(
-        detect_record_fmt(b"..\x004.0 or later\x00.."),
-        RecordFmt::Pre4
-    );
-    assert_eq!(detect_record_fmt(b"..\x004.9\x00.."), RecordFmt::Pre4);
-    assert_eq!(detect_record_fmt(b"..v4.9.0.0\x00.."), RecordFmt::Pre4);
-    // the real entry is still found after one that is skipped
-    assert_eq!(
-        detect_record_fmt(b"\x004.0 or later\x004.9.0.0\x00"),
-        RecordFmt::Main48
-    );
-}
-
-#[test]
 fn record_stream_parses_without_a_payload_around_it() {
     // the shape the record-stream fuzz target feeds in
-    for fmt in ALL_FORMATS {
-        let input = testutil::records_input(fmt);
+    for layout in LAYOUTS {
+        let input = testutil::records_input(layout);
         let stream = &input[1..];
         let mut entries = Vec::new();
-        parse_record_stream(stream, 0, &StreamReading::plain(fmt), &mut entries)
-            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(fmt)));
-        assert_eq!(entries.len(), 2, "{}", testutil::label(fmt));
+        parse_record_stream(stream, 0, &StreamReading::plain(layout), &mut entries)
+            .unwrap_or_else(|e| panic!("{}: {e}", testutil::label(layout)));
+        assert_eq!(entries.len(), 2, "{}", testutil::label(layout));
         let blob = &stream[entries[0].offset..][..entries[0].compressed_len];
         assert_eq!(blob, testutil::swap_deflate(testutil::HELLO));
     }
@@ -804,11 +848,11 @@ fn record_stream_parses_without_a_payload_around_it() {
 #[ignore = "writes files under fuzz/corpus"]
 fn write_fuzz_seeds() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus");
-    for fmt in ALL_FORMATS {
-        let name = format!("synthetic-{}", testutil::label(fmt));
+    for layout in LAYOUTS {
+        let name = format!("synthetic-{}", testutil::label(layout));
         for (target, bytes) in [
-            ("winvise", testutil::payload(fmt, 0)),
-            ("winvise_records", testutil::records_input(fmt)),
+            ("winvise", testutil::payload(layout, 0)),
+            ("winvise_records", testutil::records_input(layout)),
         ] {
             let dir = corpus.join(target);
             fs::create_dir_all(&dir).unwrap();
@@ -856,4 +900,42 @@ fn scan_skips_oversized_count() {
     buf[stream_off + 4..stream_off + 8].copy_from_slice(&5u32.to_le_bytes());
     let result = WinArchive::parse(buf, None, 0);
     assert!(result.is_err());
+}
+
+#[test]
+fn file_fields_sit_where_each_layout_says() {
+    use super::grammar::{Op, Width};
+    // the reader of a file record goes by a few positions; they have to
+    // agree with the steps that describe the whole record
+    for layout in LAYOUTS {
+        let label = testutil::label(layout);
+        let table = layout.table();
+        let file = &table.file;
+        let mut ops = table.bodies[1].expect("a file record").iter();
+        assert!(matches!(ops.next(), Some(Op::Loc)), "{label}");
+        for &kind in file.before_sizes {
+            assert!(
+                matches!(ops.next(), Some(&Op::Text(k)) if k == kind),
+                "{label}"
+            );
+        }
+        // sizes, volume, offset, attributes, three times and nine bytes
+        assert!(matches!(ops.next(), Some(Op::Skip(53))), "{label}");
+        assert!(
+            matches!(ops.next(), Some(&Op::Text(k)) if k == file.after_times),
+            "{label}"
+        );
+        let Some(&Op::Skip(fixed)) = ops.next() else {
+            panic!("{label}: no fixed fields after the times");
+        };
+        assert!(file.crc_at + 4 <= usize::from(fixed), "{label}");
+        if let Some(at) = file.source_at {
+            assert_eq!(at, usize::from(fixed), "{label}");
+            assert!(
+                matches!(ops.next(), Some(Op::Choose(Width::W1, _, _))),
+                "{label}"
+            );
+        }
+        assert!(file.folder.is_none_or(|i| i < file.before_sizes.len()));
+    }
 }

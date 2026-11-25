@@ -9,7 +9,7 @@ const USAGE: &str = "\
 usage: unvise [options] <vise_installer> [output_dir]
 
 Extracts files from Installer VISE archives (Mac and Windows).
-Accepts raw data forks, MacBinary-wrapped files, or Windows PE executables.
+Accepts raw data forks, MacBinary-wrapped files, or Windows executables.
 The output directory defaults to unvise_out/
 
 Files that belong with the installer are picked up from where it sits: Mac
@@ -171,6 +171,11 @@ fn extract_mac(data: Vec<u8>, args: &Args, encoding: NameEncoding) {
     let files = archive.files().count();
     let stubs = archive.files().filter(|f| f.is_stub()).count();
     eprintln!("VISE format: {:02x} {:02x}", info.fmt_major, info.fmt_minor);
+    if info.names_assumed {
+        eprintln!(
+            "warning: this format version is not a known one and the archive has too few records to show where they keep their names; names may be wrong"
+        );
+    }
     if encoding != NameEncoding::MacRoman {
         eprintln!("Names: {encoding:?}");
     }

@@ -47,7 +47,7 @@ A `/` in a Mac file name is written as `_`, since it would otherwise be read as 
 Neither format stores names as Unicode, and neither file table says which encoding it uses. Both kinds of installer record their language elsewhere, and that is used:
 
 - **Mac.** The installer application's `vers` resource holds a region code (0 United States, 1 France, 14 Japan and so on), which gives the script: Mac Roman, Japanese, Korean, Simplified or Traditional Chinese, or Cyrillic. That resource is in the resource fork, so it is only there when the input is still a MacBinary file. A bare data fork, or an installer without the resource, is read as Mac Roman. `--encoding macjapanese` (or `macroman`, `mackorean`, `macchinesesimp`, `macchinesetrad`, `maccyrillic`) overrides this
-- **Windows.** The language table that follows the embedded DLLs starts with the installer's main language as a Windows language ID. Names are decoded with that language's ANSI code page: 932 for Japanese, 1252 for Western European languages, and so on
+- **Windows.** The language table that follows the embedded files starts with the installer's main language as a Windows language ID. Names are decoded with that language's ANSI code page: 932 for Japanese, 1252 for Western European languages, and so on
 
 The MacBinary output keeps the original name bytes in its header whatever the encoding
 
@@ -84,7 +84,7 @@ Done: 12 extracted, 0 skipped, 0 failed
 
 ```toml
 [dependencies]
-unvise = "0.4"
+unvise = "0.5"
 ```
 
 ```rust
@@ -112,12 +112,14 @@ src/
 ├── win/            # Windows archive parser and extractor
 │   ├── mod.rs      #   archive type, layout choice, reading and extraction
 │   ├── cursor.rs   #   field reader
-│   ├── sections.rs #   DLL chain and the sections before the record stream
+│   ├── grammar.rs  #   reader for a layout's lists of steps
+│   ├── layouts.rs  #   the record layouts, as lists of steps
+│   ├── sections.rs #   embedded files and finding the record stream
 │   ├── records.rs  #   record stream, folder and file records
 │   ├── testutil.rs #   synthetic payloads for tests and fuzz seeds
 │   └── tests.rs    #   unit tests
 ├── deflate.rs      # decompression pipeline (byte-swap, cipher, DEFLATE)
-├── pe.rs           # PE payload extraction (_mvdata section or overlay)
+├── pe.rs           # Payload extraction from a Windows executable
 ├── macbinary.rs    # MacBinary wrapper detection, stripping and writing
 ├── text.rs         # name encodings: Mac scripts and Windows code pages
 ├── appledouble.rs  # AppleDouble sidecar writing
@@ -138,9 +140,9 @@ Detected from SVCT header or MacBinary wrapper
 | 03 00 - 03 05 | Word-aligned DEFLATE; shared-block slicing |
 | 03 06 - 03 07 | New CVCT header with chunk-type table |
 | 03 08 - 03 0e | CVCT body is compressed |
-| 0b 00 | Mac OS X installer bundles; two more bytes before each record's name |
+| 0b 00 | Mac OS X installer bundles; two more bytes before each record's name length |
 
-The format version is at bytes 0x12-0x13 of the SVCT header. These are archive format versions, not product versions. The highest in the 03 series is 03 0e, from Installer VISE 8.5 (July 2005)
+The format version is at bytes 0x12-0x13 of the SVCT header. It decides where a file record and a folder record keep their name: at 124 and 82 bytes into the record in 00 01, 02 01 and 02 02, 124 and 88 in 02 05 and from 03 00 to 03 03, 140 and 104 in 03 04, 184 and 148 in 03 05, 186 and 148 in 03 06 and 03 07, 190 and 152 in 03 08, 03 0a and 03 0b, 198 and 160 in 03 0c and 03 0d, 198 and 164 in 03 0e, and 212 and 178 in 0b 00. For any other version the offsets are worked out from the archive: a name is the last field of its record, so it starts its own length before the next record. If the archive has too few records to show this, the name is taken to follow its length directly, and the CLI prints a warning (`ArchiveInfo::names_assumed` in the library).
 
 Archives are structured around four chunk types:
 
@@ -179,60 +181,31 @@ Mac OS X installers (format 0b 00) are application bundles. Some keep everything
 
 ### Windows
 
-Detected from MZ/PE header. Supports PE executables with `_mvdata` section (Apple builds) or PE overlay (all other builds). Seven record layouts are handled. The mainline and Apple ones are chosen from the runtime version in the embedded vise32ex.dll. The pre-4.x DLL has no version string or version resource; its three layouts are told apart by the DLL's build date in the PE header. Whichever layout is chosen, the others are tried if it does not parse:
+Detected from the MZ header. The payload is in a PE `_mvdata` section under an SIVM header, or appended after the executable under an ESIV header. The executable can be 32-bit (PE) or 16-bit (NE)
 
-| Runtime | Notes |
-|---|---|
-| Pre-4.x: 2.4 (1997) | u8 string prefixes; blob offsets are file-relative |
-| Pre-4.x: 2.5 (1998) | As 2.4, with file records two bytes longer |
-| Pre-4.x: 2.6 (1998) | As 2.5, with longer folder, shortcut, file-association and file records |
-| Apple 2.x | `_mvdata` section; install path in record stream; stub+qdat support |
-| Mainline up to 4.6 | PE overlay; install path from folder records; folder records, file records and package entries a few bytes shorter than in 4.7 |
-| Mainline 4.7 | PE overlay; install path from folder records |
-| Mainline 4.8+ | Wider common header layout; otherwise same as 4.7 |
+The payload starts with a header: 16 bytes of fixed fields, a string with a one-byte length, one byte, a string that ends with a zero byte, and a two-byte count of embedded files. The embedded files follow: the runtime (`vise32ex.dll` in a 32-bit installer), a language file and other support DLLs. After them come several sections of installer settings, and then a typed record stream. Each record has a u32 type and a common header followed by type-specific fields. The header starts with the record's ID and the ID of the folder record that holds it (0 at the top level). Type 1 records are folders. Type 2 records are file install entries carrying the filename, sizes, a blob offset, file attributes, three timestamps (creation, last access, last write) and a CRC-32 of the contents, which is checked on extraction
 
-The payload contains a typed record stream preceded by embedded support DLLs and installer metadata. Each record has a u32 type tag and a common header followed by type-specific fields. The common header starts with the record's ID and the ID of the folder record that holds it (0 at the top level). Type 1 records are folders. Type 2 records are file install entries carrying the filename, sizes, a blob offset, file attributes, three timestamps (creation, last access, last write) and a CRC-32 of the contents, which is checked on extraction
+The layout of all of this changed from one Installer VISE release to the next, and the installer does not record which release built it. Every installer carries the runtime that reads it, so the layouts this parser knows are taken from runtimes: one for each group of runtimes that read alike.
 
-Type 0x24 records are screens the installer shows, with a u32 subtype first. Three subtypes are read: a custom dialog (0), which is a list of controls each with a kind, text and rectangle; the destination screen (9); and the finish screen of 4.8 and later (0x10). Four control kinds are accepted in a dialog: caption, button, text and bitmap
+To choose a layout, the parser reads the sections in front of the stream with each, newest first. A layout is right when its sections end on a record stream, every record the stream declares then reads to its end, and the stream ends before the first file's data. A layout that is slightly wrong fails this within a few records. Several layouts can pass for an installer that has none of the record types they differ in; they then read it alike
 
-The pre-4.x and Apple runtimes store an install path with each file, which is used as its folder. The mainline 4.x runtimes do not, so there the folder comes from following parent IDs up through the folder records
-
-The stream's position is not stored anywhere in the payload. The installer gets there by reading the sections that come before it, and so does this parser. After the DLL chain, in order:
-
-| Section | Contents |
-|---|---|
-| Language table | u16 0, language ID, two names, the title and prompt of the language dialog, then a u16 count of further languages, each a language ID and two names |
-| Settings | u32 length, then one compressed block that decompresses to data starting `ESIVCSIM` |
-| Billboards (mainline only) | u8, u32 count, then ordinary type 0x0f records |
-| Variables (mainline only) | u32 count; name and value strings |
-| Web-install items (mainline only) | u32 count; a 16-byte GUID and two strings each |
-| Download servers | u32 count; a GUID, five strings and a u16 each |
-| Support files | count (u16, or u8 in the Apple fork), then `[u8 name length][name][12 bytes][u32 size][data]` entries, the same form as the DLL chain |
-| Packages | u16 count; name and description, a u8, a third text, 31 fixed bytes (32 from 4.8), a 36-byte mask, a u8, a feature list (u16 count, 5 bytes each), and a last field of 1 byte (up to 4.6 and Apple) or 4. Each of the three texts is a string followed by a u16 count of translations, each a language ID and a string |
-
-The record stream starts where the packages end
-
-When the sections cannot all be read (the pre-4.x and 1998 runtimes store their settings inline, in a form that is not decoded), the stream is located from its two nearest neighbours instead. The support files are a count followed by named entries whose sizes must chain exactly, which is very unlikely by accident; the package list after them has a few known entry layouts, and the right one ends on a record header. Only if that also fails is the payload scanned for something that looks like a stream start, and a stream found that way has to place at least one file to be accepted
+Some layouts store a folder with each file, which is then used. The others do not, so there the folder comes from following parent IDs up through the folder records
 
 ### Reading the records
 
-Only two record types matter for extraction: folders (type 1) and files (type 2). What is needed from them sits at the front of the record, where the runtimes agree. Everything else, including the rest of a file record and all the screens, dialogs, registry and shortcut records, only has to be stepped over, and those bodies differ between runtime builds in ways that are not all known
+Each layout describes every record type, so a stream is normally read from its declared count to its end without searching. Searching is kept for damaged copies: when a record does not end where another starts, the next one is found by its header. A record start is a type in range, a small record ID and parent ID, a common header that parses, and for a folder or file record a body that parses too. Bytes inside a record can pass for a header, so a candidate whose parent ID is 0 or the ID of a record already read is taken over an earlier one whose parent is unknown. The stream's declared record count has to come out exactly, and every file is checked against its CRC-32 when read
 
-So each record is stepped over by its known layout, and the result is checked: it has to end where another record starts. A record start is a type in range, a small record ID and parent ID, a common header that parses, and for a folder or file record a body that parses too. When the step does not end on one, the next record is found by searching for its header. Bytes inside a record can pass for a header, so a candidate whose parent ID is 0 or the ID of a record already read is taken over an earlier one whose parent is unknown. Three things keep that honest: the stream declares its record count, which has to come out exactly; a layout that needs no searching is preferred over one that does; and every file is checked against its CRC-32 when read
+If the sections in front of the stream cannot be read with any layout, the payload is scanned for something that looks like a stream start, and a stream found that way has to place every file it lists to be accepted outright. Failing that, the reading that places the most files is used
 
-Blob offsets count from the start of the payload in newer runtimes and from the start of the executable in older ones. Rather than assume where that changed, the parser decodes a small file at both positions and keeps the one that matches the recorded size and CRC
+Blob offsets count from the start of the payload in some runtimes and from the start of the executable in others, and two runtimes that share a layout can differ in it. The parser decodes a small file at both positions and keeps the one that matches the recorded size and CRC
 
 A file whose record names a part that is not there, or whose data lies past the end of the executable, is reported as skipped
 
-What follows the CRC in a file record differs between builds of the same runtime. From it the parser takes one thing: a source byte, which is 4 when the file belongs to a download item of a web installer, whose GUID then follows. Builds from 1999 on also end the record with a CRC-32 of the stored bytes; earlier ones end four bytes sooner, which is noticed from the first file record and applied to the rest
+In the layouts that have download items, a file record has a source byte, which is 4 when the file belongs to a download item of a web installer; the item's 16-byte ID then follows
 
 A web installer lists every file it installs and carries only some of them; the rest are fetched when it runs. Files that name a download item are reported as skipped. Not every downloaded file names one. So in an installer that embeds the download library (`tcpip32.dll`), a file that does not read is also reported as skipped when its recorded position could not hold its data: in front of the file data, past the end, or shared with another file. A file that sits where a file should and does not read is reported as failed
 
 Some installers record a size that is not the size of the file they store, next to a CRC-32 that is right for it. When a file does not decode to its recorded size, it is decoded again without the size, up to twice the recorded size, and accepted if the CRC-32 matches
-
-Type 0x15 records are binary patches against files already installed (`name.upd`). They are not extracted
-
-File data is stored as DEFLATE with a byte-pair swap applied to the compressed stream (no substitution cipher, unlike Mac). Each file is compressed independently, and its stream can hold stored blocks aligned to 16-bit words, as on Mac
 
 ### Installers in more than one file
 
@@ -250,6 +223,8 @@ Unit tests cover the decompression pipeline, parser, and safety checks, and buil
 ```sh
 cargo test
 ```
+
+The Windows test installers are built from the same layout tables the parser reads with. They check the reader, not the tables: a wrong table would pass them.
 
 CI also runs the formatter and linter:
 
