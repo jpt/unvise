@@ -1,28 +1,33 @@
-//! Minimal PE parser for extracting VISE payloads from Windows executables
+//! Minimal parser of Windows executables, for extracting VISE payloads
 //!
-//! Searches for an `_mvdata` section first, then falls back to the PE overlay
-//! (data appended past the last section). Only parses enough of the PE headers
-//! to locate section boundaries -- no imports, exports, or relocations
+//! In a 32-bit executable (PE) it searches for an `_mvdata` section first,
+//! then falls back to the overlay (data appended past the last section). In
+//! a 16-bit one (NE) the payload follows the executable. Only enough of the
+//! headers is read to find where the executable's own data ends -- no
+//! imports, exports, or relocations
 
 use crate::Error;
 
-/// Extracts the VISE payload from a PE executable
+/// Extracts the VISE payload from a Windows executable
 ///
 /// Returns `(payload_slice, file_offset)`: the `_mvdata` section contents if
-/// present, otherwise the overlay region past the last section. The file
-/// offset is needed to translate the blob offsets of the pre-4.x runtimes, which count from
-/// the start of the file
+/// present, otherwise what follows the executable. The file offset is needed
+/// to translate the blob offsets of the older runtimes, which count from the
+/// start of the file
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidArchive`] if the data is not a valid PE or contains
-/// no VISE payload
+/// Returns [`Error::InvalidArchive`] if the data is not a valid executable
+/// or contains no VISE payload
 pub fn extract_payload(data: &[u8]) -> Result<(&[u8], usize), Error> {
     if data.len() < 0x40 || &data[..2] != b"MZ" {
-        return Err(Error::InvalidArchive("not a PE executable".into()));
+        return Err(Error::InvalidArchive("not a Windows executable".into()));
     }
 
     let pe_off = read_u32(data, 0x3C)? as usize;
+    if data.get(pe_off..).is_some_and(|ne| ne.starts_with(b"NE")) {
+        return ne_overlay(data, pe_off);
+    }
     // everything from the PE signature on; header offsets below are relative
     // to it, so a pointer near the top of the address space cannot overflow
     let pe = data
@@ -80,6 +85,59 @@ pub fn extract_payload(data: &[u8]) -> Result<(&[u8], usize), Error> {
     Err(Error::InvalidArchive(
         "no _mvdata section or overlay found".into(),
     ))
+}
+
+/// The data past the end of a 16-bit executable, whose header is at
+/// `ne_off`. The executable ends where the last of its segments, its
+/// resources and its table of non-resident names does
+fn ne_overlay(data: &[u8], ne_off: usize) -> Result<(&[u8], usize), Error> {
+    let ne = &data[ne_off..];
+    let u16_at = |off: usize| read_u16(ne, off).map(usize::from);
+    let shift =
+        |value: usize, by: usize| u32::try_from(by).ok().and_then(|by| value.checked_shl(by));
+    let overflow = || Error::InvalidArchive("executable header fields out of range".into());
+
+    let names = (read_u32(ne, 0x2C)? as usize).saturating_add(u16_at(0x20)?);
+    let mut end = names;
+
+    let segment_shift = u16_at(0x32)?;
+    let segment_table = u16_at(0x22)?;
+    for i in 0..u16_at(0x1C)? {
+        let entry = segment_table + i * 8;
+        let (sector, len) = (u16_at(entry)?, u16_at(entry + 2)?);
+        // a segment with no sector has no data in the file; a length of 0
+        // stands for 64 KiB
+        if sector != 0 {
+            let len = if len == 0 { 0x1_0000 } else { len };
+            end = end.max(shift(sector, segment_shift).ok_or_else(overflow)? + len);
+        }
+    }
+
+    // the resource table is a shift, then for each type an ID, a count and
+    // four more bytes, followed by 12 bytes for each resource: its offset
+    // and its length in units of the shift. A type ID of 0 ends it. The
+    // table is absent when the next table starts where it would
+    let mut at = u16_at(0x24)?;
+    if at != u16_at(0x26)? {
+        let resource_shift = u16_at(at)?;
+        at += 2;
+        while u16_at(at)? != 0 {
+            let count = u16_at(at + 2)?;
+            at += 8;
+            for _ in 0..count {
+                let past = u16_at(at)? + u16_at(at + 2)?;
+                end = end.max(shift(past, resource_shift).ok_or_else(overflow)?);
+                at += 12;
+            }
+        }
+    }
+
+    match data.get(end..) {
+        Some(overlay) if overlay.len() > 8 => Ok((overlay, end)),
+        _ => Err(Error::InvalidArchive(
+            "nothing follows the 16-bit executable".into(),
+        )),
+    }
 }
 
 fn read_array<const N: usize>(data: &[u8], off: usize) -> Result<[u8; N], Error> {
@@ -154,6 +212,42 @@ mod tests {
         let pe = make_pe(&sections, b"ESIV overlay data here");
         let (payload, _off) = extract_payload(&pe).unwrap();
         assert_eq!(&payload[..4], b"ESIV");
+    }
+
+    #[test]
+    fn finds_what_follows_a_16_bit_executable() {
+        // one segment of 0x30 bytes in sector 1 (sectors of 0x200), and one
+        // resource of two units of 0x10 at unit 0x30: the file ends at 0x320
+        let ne_off = 0x40;
+        let mut data = vec![0u8; 0x320];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x3C] = 0x40;
+        let put = |data: &mut Vec<u8>, off: usize, v: u16| {
+            data[ne_off + off..][..2].copy_from_slice(&v.to_le_bytes());
+        };
+        data[ne_off..ne_off + 2].copy_from_slice(b"NE");
+        put(&mut data, 0x1C, 1); // segments
+        put(&mut data, 0x22, 0x40); // segment table
+        put(&mut data, 0x24, 0x48); // resource table
+        put(&mut data, 0x26, 0x60); // the table after it
+        put(&mut data, 0x32, 9); // segment shift
+        put(&mut data, 0x40, 1);
+        put(&mut data, 0x42, 0x30);
+        put(&mut data, 0x48, 4); // resource shift
+        put(&mut data, 0x4A, 0x8001); // a type
+        put(&mut data, 0x4C, 1); // with one resource
+        put(&mut data, 0x52, 0x30);
+        put(&mut data, 0x54, 2);
+        data.extend_from_slice(b"ESIV and more");
+        let (payload, off) = extract_payload(&data).unwrap();
+        assert_eq!(off, 0x320);
+        assert_eq!(payload, b"ESIV and more");
+
+        // with nothing after it there is no payload
+        assert!(extract_payload(&data[..0x320]).is_err());
+        // a table that runs off the end is an error, not a panic
+        put(&mut data, 0x24, 0xFFF0);
+        assert!(extract_payload(&data).is_err());
     }
 
     #[test]

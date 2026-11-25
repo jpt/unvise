@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- Windows installers whose executable is 16-bit (NE)
+
+### Changed
+- Windows: the embedded files are found from the payload header and its count of them, not by searching for `vise32ex.dll` and reading on while names look like text
+- Windows: 22 record layouts in place of 7. Each describes the header of a record, every record type and the sections in front of the record stream, and all of it is read exactly
+- Windows: a layout is chosen by reading the installer with it. The embedded runtime is no longer inspected for a version string or a build date
+- Windows: the record stream is located by reading the sections in front of it, in every layout
+- Mac: where a file or folder record keeps its name comes from the archive's format version, for the versions 00 01, 02 01, 02 02, 02 05, 03 00 to 03 08, 03 0a to 03 0e and 0b 00. For any other version it is still worked out from the spacing of the records. When an archive of such a version has too few records for that, `ArchiveInfo::names_assumed` is set and the CLI prints a warning
+
+### Fixed
+- Installers built with Installer VISE 2.7.1 did not parse
+- An embedded file with a name outside ASCII ended the list of embedded files, so it and the ones after it were missing and the record stream had to be searched for
+- A layout that read the last record of a stream into the file data could be chosen, which marked a file as misplaced
+- A layout under which the last record of a stream did not read could be chosen
+- Windows: the main language, which sets the code page of names, was read from the wrong place in an installer that has the block the second flag byte brings in
+- An embedded file with nothing stored ended the list of embedded files
+- A record stream whose first record is of a type with nothing after its number was not found by the sections in front of it
+- Windows installers holding record types that the layouts did not describe were read by searching for the next record
+- A Windows download item has a 16-byte ID in every layout that has download items
+- Windows, one layout: in the settings in front of the record stream, whether a screen's string is empty decides what follows it. It was read as if every such string were empty, so the record stream of an installer with one set had to be searched for
+- Mac folder names could be read from the wrong place in an archive with few folder records
+- A Mac file or folder name that contained a record tag was taken for a record
+- Mac, for a format version that is not listed: the last record of a table could decide where names are read from, though other data can follow its name
+
 ## 0.4.0
 
 ### Added

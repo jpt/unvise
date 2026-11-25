@@ -164,6 +164,10 @@ pub struct ArchiveInfo {
     pub num_segments: usize,
     pub fmt_major: u8,
     pub fmt_minor: u8,
+    /// Whether where the records keep their names was assumed. That happens
+    /// when the format version is not one of the listed ones and the archive
+    /// has too few records to show it. Names can then be wrong
+    pub names_assumed: bool,
 }
 
 /// Parses the SVCT header and CVCT file table from raw archive data
@@ -173,6 +177,16 @@ pub struct ArchiveInfo {
 /// Returns [`Error::InvalidArchive`] if the data lacks an SVCT header or
 /// the CVCT pointer is invalid
 pub fn parse(data: &[u8], encoding: NameEncoding) -> Result<ArchiveInfo, Error> {
+    parse_as(data, encoding, true)
+}
+
+/// [`parse`], with the format version taken as one that is not listed when
+/// `listed` is false, so that a check can compare the two
+pub(crate) fn parse_as(
+    data: &[u8],
+    encoding: NameEncoding,
+    listed: bool,
+) -> Result<ArchiveInfo, Error> {
     if data.len() < 0x28 || &data[..4] != b"SVCT" {
         return Err(Error::InvalidArchive("missing SVCT header".into()));
     }
@@ -214,13 +228,35 @@ pub fn parse(data: &[u8], encoding: NameEncoding) -> Result<ArchiveInfo, Error> 
     } else {
         &decompressed_body
     };
-    let tags = scan_tags(parse_data, body_start);
     // From format 0b (the Mac OS X installers) both record kinds have two
     // more bytes of fields before the name length
     let later = if fmt_major >= FMT_OSX { 2 } else { 0 };
     let (fvct_nlen, dvct_nlen) = (FVCT_NLEN + later, DVCT_NLEN + later);
-    let fvct_name_off = infer_name_off(parse_data, &tags, TagKind::Fvct, fvct_nlen);
-    let dvct_name_off = infer_name_off(parse_data, &tags, TagKind::Dvct, dvct_nlen);
+    // which kinds of record had nothing to show where their name is
+    let mut assumed = (false, false);
+    let known = if listed {
+        name_offsets(fmt_major, fmt_minor)
+    } else {
+        None
+    };
+    let (fvct_name_off, dvct_name_off) = known.unwrap_or_else(|| {
+        // a version that is not listed: the archive's own records show
+        // where their names are. With too few records to tell, the name is
+        // taken to follow its length directly
+        let (fvct, dvct) = infer_name_offsets(parse_data, body_start, fvct_nlen, dvct_nlen);
+        assumed = (fvct.is_none(), dvct.is_none());
+        (fvct.unwrap_or(fvct_nlen + 2), dvct.unwrap_or(dvct_nlen + 2))
+    });
+    let tags = scan_tags(
+        parse_data,
+        body_start,
+        (fvct_nlen, fvct_name_off),
+        (dvct_nlen, dvct_name_off),
+    );
+    let names_assumed = tags.iter().any(|&(_, kind)| match kind {
+        TagKind::Fvct => assumed.0,
+        TagKind::Dvct => assumed.1,
+    });
 
     let mut entries = Vec::with_capacity(tags.len());
     // names of the folders enclosing the current record, outermost first.
@@ -271,6 +307,7 @@ pub fn parse(data: &[u8], encoding: NameEncoding) -> Result<ArchiveInfo, Error> 
         num_segments,
         fmt_major,
         fmt_minor,
+        names_assumed,
     })
 }
 
@@ -332,98 +369,169 @@ fn join_dirs(dirs: &[String]) -> String {
     out
 }
 
-/// Non-directory CVCT record tags, used only for stride inference
-/// FVCT and DVCT are matched explicitly in `scan_tags` and are not in this list
-const OTHER_TAGS: &[&[u8; 4]] = &[
-    b"PACK", b"BBrd", b"CODE", b"BDIR", b"PROJ", b"INDN", b"DfIl",
-];
-
-/// Tag type classification for scan results
+/// The two kinds of record that are read
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TagKind {
     Fvct,
     Dvct,
-    Other,
 }
 
-/// Scans for known CVCT tags starting at `from`. Returns (offset, kind) pairs
-/// All tag types are scanned so stride inference works even with single-record
-/// archives; only FVCT and DVCT produce extracted entries
-fn scan_tags(data: &[u8], from: usize) -> Vec<(usize, TagKind)> {
-    let mut tags = Vec::new();
+/// Finds the file and folder records from `from` on, by their tags.
+/// `fvct` and `dvct` are where each kind keeps its name length and its
+/// name. A record runs at least to the end of its name, so the search for
+/// the next one starts there, and a name cannot be taken for a tag
+fn scan_tags(
+    data: &[u8],
+    from: usize,
+    fvct: (usize, usize),
+    dvct: (usize, usize),
+) -> Vec<(usize, TagKind)> {
+    record_marks(data, from, Some(fvct), Some(dvct))
+        .into_iter()
+        .filter(|&(_, record)| record)
+        .map(|(at, _)| {
+            let kind = if data[at..].starts_with(b"FVCT") {
+                TagKind::Fvct
+            } else {
+                TagKind::Dvct
+            };
+            (at, kind)
+        })
+        .collect()
+}
+
+/// Tags of the other things a file table holds. A file or folder record
+/// ends where the next tag of any kind starts
+const OTHER_TAGS: [&[u8; 4]; 7] = [
+    b"PACK", b"BBrd", b"CODE", b"BDIR", b"PROJ", b"INDN", b"DfIl",
+];
+
+/// Every place from `from` on where a tag stands, and whether it is the tag
+/// of a file or folder record. Where `fvct` or `dvct` says where that kind
+/// keeps its name length and its name, the name is stepped over, so that it
+/// cannot be taken for a tag
+fn record_marks(
+    data: &[u8],
+    from: usize,
+    fvct: Option<(usize, usize)>,
+    dvct: Option<(usize, usize)>,
+) -> Vec<(usize, bool)> {
+    let mut marks = Vec::new();
     let mut p = from;
-    while p + 4 <= data.len() {
-        let tag = &data[p..p + 4];
-        if tag == b"FVCT" {
-            tags.push((p, TagKind::Fvct));
-            p += 4;
-        } else if tag == b"DVCT" {
-            tags.push((p, TagKind::Dvct));
-            p += 4;
-        } else if OTHER_TAGS.iter().any(|t| tag == *t) {
-            tags.push((p, TagKind::Other));
+    while let Some(tag) = data.get(p..p + 4) {
+        let name = match tag {
+            b"FVCT" => Some(fvct),
+            b"DVCT" => Some(dvct),
+            _ => None,
+        };
+        if let Some(name) = name {
+            marks.push((p, true));
+            p += name
+                .and_then(|(len_at, name_at)| Some(name_at + usize::from(*data.get(p + len_at)?)))
+                .unwrap_or(4);
+        } else if OTHER_TAGS.iter().any(|other| tag == *other) {
+            marks.push((p, false));
             p += 4;
         } else {
             p += 1;
         }
     }
-    tags
+    marks
 }
 
-/// Infers the name field offset for a tag type by examining stride patterns.
-/// The name is always the last field in a record, so `name_off` = stride - nlen,
-/// where the stride is the distance to the next record. Every record of the
-/// type votes, and the most common answer wins.
-fn infer_name_off(
+/// Where file records and folder records keep their names, worked out from
+/// the archive. The first round takes every tag it sees for one; the second
+/// uses the offsets of the first to step over the names, where a tag can
+/// turn up by chance
+fn infer_name_offsets(
     data: &[u8],
-    tags: &[(usize, TagKind)],
-    target: TagKind,
-    nlen_off: usize,
-) -> usize {
-    // Records sit back to back, so a record ends where the next file or
-    // folder record starts, whichever kind that is. Measuring to the next
-    // record of the same kind instead would count a folder record lying
-    // between two files as part of the first file.
-    //
-    // Precompute each index's next record in one reverse pass. A naive
-    // inner search is O(tags^2), which a body densely packed with markers
-    // (post-decompression, attacker-influenced) could exploit to stall the parser
-    let mut next_record_pos = vec![None; tags.len()];
-    let mut seen: Option<usize> = None;
-    for i in (0..tags.len()).rev() {
-        next_record_pos[i] = seen;
-        if tags[i].1 != TagKind::Other {
-            seen = Some(tags[i].0);
+    from: usize,
+    fvct_nlen: usize,
+    dvct_nlen: usize,
+) -> (Option<usize>, Option<usize>) {
+    let infer = |marks: &[(usize, bool)]| {
+        (
+            infer_name_offset(data, marks, *b"FVCT", fvct_nlen),
+            infer_name_offset(data, marks, *b"DVCT", dvct_nlen),
+        )
+    };
+    let (fvct, dvct) = infer(&record_marks(data, from, None, None));
+    infer(&record_marks(
+        data,
+        from,
+        fvct.map(|at| (fvct_nlen, at)),
+        dvct.map(|at| (dvct_nlen, at)),
+    ))
+}
+
+/// Where the records with `tag` keep their name, worked out from the
+/// records themselves. The name is the last field of a record, so it starts
+/// its own length before the next record. Every record that another record
+/// follows votes, and the most common answer wins. The last record is gone
+/// by only when no other can vote. `None` if no record can
+fn infer_name_offset(
+    data: &[u8],
+    marks: &[(usize, bool)],
+    tag: [u8; 4],
+    name_len_at: usize,
+) -> Option<usize> {
+    // where the record after each mark starts, and whether a record does
+    // follow. After the last record the next tag of any kind bounds it, but
+    // other data can stand between its name and that tag
+    let mut next_record = None;
+    let mut ends = vec![(None, false); marks.len()];
+    for (i, &(pos, record)) in marks.iter().enumerate().rev() {
+        ends[i] = match next_record {
+            Some(next) => (Some(next), true),
+            None => (marks.get(i + 1).map(|&(next, _)| next), false),
+        };
+        if record {
+            next_record = Some(pos);
         }
     }
-
     let mut votes: Vec<(usize, usize)> = Vec::new();
-
-    for i in 0..tags.len().saturating_sub(1) {
-        let (pos, kind) = tags[i];
-        if kind != target {
+    let mut last = None;
+    for (&(pos, _), (end, followed)) in marks.iter().zip(ends) {
+        let (Some(end), Some(&len)) = (end, data.get(pos + name_len_at)) else {
+            continue;
+        };
+        let (len, stride) = (usize::from(len), end - pos);
+        if !data[pos..].starts_with(&tag) || len == 0 || len >= stride {
             continue;
         }
-        // after the last record, the next tag of any type bounds it
-        let stride_to = next_record_pos[i].unwrap_or(tags[i + 1].0);
-        let stride = stride_to - pos;
-        if pos + nlen_off >= data.len() {
+        let offset = stride - len;
+        if !followed {
+            last = Some(offset);
             continue;
         }
-        let nlen = usize::from(data[pos + nlen_off]);
-        if nlen > 0 && nlen < stride {
-            let off = stride - nlen;
-            match votes.iter_mut().find(|(o, _)| *o == off) {
-                Some(entry) => entry.1 += 1,
-                None => votes.push((off, 1)),
-            }
+        match votes.iter_mut().find(|(o, _)| *o == offset) {
+            Some(vote) => vote.1 += 1,
+            None => votes.push((offset, 1)),
         }
     }
-
     votes
         .into_iter()
         .max_by_key(|&(_, count)| count)
-        .map_or(nlen_off + 2, |(off, _)| off)
+        .map(|(offset, _)| offset)
+        .or(last)
+}
+
+/// Where a file record and a folder record keep their name, counted from
+/// the record's tag, for a format version. `None` for a version that is not
+/// listed
+const fn name_offsets(major: u8, minor: u8) -> Option<(usize, usize)> {
+    Some(match (major, minor) {
+        (0, 1) | (2, 1..=2) => (124, 82),
+        (2, 5) | (3, 0..=3) => (124, 88),
+        (3, 4) => (140, 104),
+        (3, 5) => (184, 148),
+        (3, 6..=7) => (186, 148),
+        (3, 8 | 0x0a..=0x0b) => (190, 152),
+        (3, 0x0c..=0x0d) => (198, 160),
+        (3, 0x0e) => (198, 164),
+        (FMT_OSX, 0) => (212, 178),
+        _ => return None,
+    })
 }
 
 fn read_array<const N: usize>(data: &[u8], off: usize) -> Result<[u8; N], Error> {
@@ -503,8 +611,7 @@ pub(crate) mod testutil {
         pub modified: u32,
     }
 
-    /// An FVCT record with the name as its last field, two bytes after the
-    /// length byte, which is where the parser looks by default
+    /// An FVCT record as format 03 03 lays it out
     pub(crate) fn fvct_record(f: &TestFile) -> Vec<u8> {
         let mut r = vec![0u8; FVCT_NLEN + 2];
         r[..4].copy_from_slice(b"FVCT");
@@ -527,7 +634,7 @@ pub(crate) mod testutil {
     }
 
     pub(crate) fn dvct_record(name: &str, depth: u16) -> Vec<u8> {
-        let mut r = vec![0u8; DVCT_NLEN + 2];
+        let mut r = vec![0u8; super::name_offsets(3, 3).unwrap().1];
         r[..4].copy_from_slice(b"DVCT");
         r[super::DVCT_DEPTH..super::DVCT_DEPTH + 2].copy_from_slice(&depth.to_be_bytes());
         r[DVCT_NLEN] = u8::try_from(name.len()).unwrap();
@@ -544,80 +651,80 @@ mod tests {
         parse(data, NameEncoding::MacRoman)
     }
 
-    fn make_tag_body(tags: &[(&[u8; 4], usize)]) -> Vec<u8> {
-        let total: usize = tags.iter().map(|(_, sz)| 4 + sz).sum();
-        let mut buf = vec![0u8; total];
-        let mut pos = 0;
-        for (tag, body_len) in tags {
-            buf[pos..pos + 4].copy_from_slice(*tag);
-            pos += 4 + body_len;
+    #[test]
+    fn records_are_found_by_tag_and_names_are_not_searched() {
+        let (fvct, dvct) = ((FVCT_NLEN, 124), (DVCT_NLEN, 88));
+        // a folder whose name is a tag, then a file
+        let mut data = vec![0u8; 88];
+        data[..4].copy_from_slice(b"DVCT");
+        data[DVCT_NLEN] = 4;
+        data.extend_from_slice(b"FVCT");
+        let file_at = data.len();
+        data.extend_from_slice(b"FVCT");
+        data.resize(file_at + 124, 0);
+        let tags = scan_tags(&data, 0, fvct, dvct);
+        assert_eq!(tags, [(0, TagKind::Dvct), (file_at, TagKind::Fvct)]);
+        // other bytes are passed over
+        assert_eq!(
+            scan_tags(b"....XXXX....", 0, fvct, dvct),
+            Vec::<(usize, TagKind)>::new()
+        );
+    }
+
+    #[test]
+    fn an_unlisted_version_gets_its_name_offsets_from_its_records() {
+        assert_eq!(name_offsets(2, 3), None);
+        // two file records 200 bytes apart with six-byte names, then a tag
+        // of another kind: the names start 194 bytes in
+        let mut data = vec![0u8; 404];
+        for at in [0, 200] {
+            data[at..at + 4].copy_from_slice(b"FVCT");
+            data[at + FVCT_NLEN] = 6;
         }
-        buf
+        data[400..].copy_from_slice(b"PACK");
+        let marks = record_marks(&data, 0, None, None);
+        assert_eq!(marks, [(0, true), (200, true), (400, false)]);
+        assert_eq!(
+            infer_name_offset(&data, &marks, *b"FVCT", FVCT_NLEN),
+            Some(194)
+        );
+        // no folder record, so nothing to go by
+        assert_eq!(infer_name_offset(&data, &marks, *b"DVCT", DVCT_NLEN), None);
     }
 
     #[test]
-    fn scan_tags_finds_all_types() {
-        let data = make_tag_body(&[(b"FVCT", 186), (b"PACK", 26), (b"BBrd", 62), (b"INDN", 10)]);
-        let tags = scan_tags(&data, 0);
-        assert_eq!(tags.len(), 4);
-        assert_eq!(tags[0], (0, TagKind::Fvct));
-        assert_eq!(tags[1], (190, TagKind::Other));
-        assert_eq!(tags[2], (220, TagKind::Other));
-        assert_eq!(tags[3], (286, TagKind::Other));
+    fn a_tag_inside_a_name_does_not_count_as_a_record() {
+        // five file records 200 bytes apart; the name of the second is a tag
+        let mut data = vec![0u8; 1004];
+        for at in [0, 200, 400, 600, 800] {
+            data[at..at + 4].copy_from_slice(b"FVCT");
+            data[at + FVCT_NLEN] = 6;
+        }
+        data[200 + FVCT_NLEN] = 4;
+        data[396..400].copy_from_slice(b"DVCT");
+        data[1000..].copy_from_slice(b"PACK");
+        assert_eq!(record_marks(&data, 0, None, None).len(), 7);
+        let (fvct, dvct) = infer_name_offsets(&data, 0, FVCT_NLEN, DVCT_NLEN);
+        assert_eq!(fvct, Some(194));
+        // the one folder tag was a name
+        assert_eq!(dvct, None);
     }
 
     #[test]
-    fn scan_tags_ignores_unknown() {
-        let mut data = vec![0u8; 20];
-        data[0..4].copy_from_slice(b"FVCT");
-        data[8..12].copy_from_slice(b"XXXX");
-        data[16..20].copy_from_slice(b"DVCT");
-        let tags = scan_tags(&data, 0);
-        assert_eq!(tags.len(), 2);
-        assert_eq!(tags[0].1, TagKind::Fvct);
-        assert_eq!(tags[1].1, TagKind::Dvct);
-    }
-
-    #[test]
-    fn infer_name_off_multi_record() {
-        // Two FVCT records 200 bytes apart, name_len=6, so name_off = 194
-        let mut data = vec![0u8; 406];
-        data[0..4].copy_from_slice(b"FVCT");
-        data[FVCT_NLEN] = 6;
-        data[200..204].copy_from_slice(b"FVCT");
-        data[200 + FVCT_NLEN] = 6;
-        data[400..404].copy_from_slice(b"PACK");
-        let tags = scan_tags(&data, 0);
-        let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
-        assert_eq!(off, 194);
-    }
-
-    #[test]
-    fn infer_name_off_single_record_cross_type_fallback() {
-        // Single FVCT followed by a different tag type, forcing the cross-type
-        // stride fallback (no consecutive same-type tags to vote on)
-        let mut data = vec![0u8; 230];
-        data[0..4].copy_from_slice(b"FVCT");
-        data[FVCT_NLEN] = 6;
-        data[184..190].copy_from_slice(b"myfile");
-        data[190..194].copy_from_slice(b"PACK");
-        let tags = scan_tags(&data, 0);
-        assert_eq!(tags.len(), 2);
-        let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
-        assert_eq!(off, 184);
-        assert_eq!(mac_str(&data, off, 6, NameEncoding::MacRoman), "myfile");
-    }
-
-    #[test]
-    fn infer_name_off_default_fallback() {
-        // Single tag, no next tag, so it falls back to nlen_off + 2
-        let mut data = vec![0u8; 200];
-        data[0..4].copy_from_slice(b"FVCT");
-        data[FVCT_NLEN] = 4;
-        let tags = scan_tags(&data, 0);
-        assert_eq!(tags.len(), 1);
-        let off = infer_name_off(&data, &tags, TagKind::Fvct, FVCT_NLEN);
-        assert_eq!(off, FVCT_NLEN + 2);
+    fn the_last_record_does_not_outvote_one_that_a_record_follows() {
+        // two file records; other data stands between the name of the
+        // second and the next tag
+        let mut data = vec![0u8; 464];
+        for at in [0, 200] {
+            data[at..at + 4].copy_from_slice(b"FVCT");
+            data[at + FVCT_NLEN] = 6;
+        }
+        data[460..].copy_from_slice(b"PACK");
+        let (fvct, _) = infer_name_offsets(&data, 0, FVCT_NLEN, DVCT_NLEN);
+        assert_eq!(fvct, Some(194));
+        // on its own, the last record is all there is to go by
+        let (fvct, _) = infer_name_offsets(&data, 200, FVCT_NLEN, DVCT_NLEN);
+        assert_eq!(fvct, Some(254));
     }
 
     /// Minimal v3 archive whose CVCT directory is flagged compressed: `body` is
