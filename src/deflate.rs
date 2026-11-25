@@ -249,13 +249,14 @@ fn with_pairs_swapped<R>(src: &[u8], decode: impl FnOnce(&[u8]) -> Option<R>) ->
 ///
 /// # Errors
 ///
-/// Returns [`Error::Decompression`] if the input is not valid word-aligned DEFLATE
-pub fn decompress_raw_word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+/// Returns [`Error::Decompression`] if the input is not valid word-aligned
+/// DEFLATE, or if the output would pass `limit` bytes
+pub fn decompress_raw_word_deflate(input: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
     let mut swapped = input.to_vec();
     for pair in swapped.chunks_exact_mut(2) {
         pair.swap(0, 1);
     }
-    word_deflate(&swapped, expected)
+    word_deflate_hinted(&swapped, 0, 0, limit).map(|(data, _)| data)
 }
 
 /// Largest output `comp_len` compressed bytes could legitimately produce. A
@@ -281,6 +282,7 @@ fn output_ceiling(comp_len: usize, expected: usize) -> usize {
 /// Returns [`Error::Decompression`] if the stream is malformed, does not
 /// produce exactly `expected` bytes, or expands past what its input could
 /// legitimately produce
+#[cfg(any(test, feature = "fuzzing"))]
 pub fn word_deflate(input: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
     word_deflate_hinted(input, expected, expected, usize::MAX).map(|(data, _)| data)
 }
@@ -1054,7 +1056,7 @@ mod tests {
             0xe5, 0xcf, 0x53, 0x2e, 0xe7, 0x85, 0x54, 0x93, 0xc2, 0x14, 0x2d, 0xe4, 0xce, 0xd8, 0x02, 0x80,
             0x00, 0x0f,
         ];
-        let result = decompress_raw_word_deflate(&BODY, 0).unwrap();
+        let result = decompress_raw_word_deflate(&BODY, usize::MAX).unwrap();
         assert_eq!(result.len(), 432);
         assert_eq!(&result[0..4], b"FVCT");
     }
@@ -1068,6 +1070,6 @@ mod tests {
             0xdb, 0x04, 0x08, 0x2b, 0xa5, 0xa1, 0x7f, 0xc5, 0x41, 0x11, 0xa2, 0x3f, 0x03, 0x1a,
             0x25, 0xa1, 0x86, 0x92,
         ];
-        assert!(decompress_raw_word_deflate(&BODY, 0).is_err());
+        assert!(decompress_raw_word_deflate(&BODY, usize::MAX).is_err());
     }
 }

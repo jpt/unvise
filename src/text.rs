@@ -103,13 +103,17 @@ pub(crate) fn windows_code_page(language: u16) -> &'static Encoding {
         // in Cyrillic, which shares its language number with Croatian (1)
         // and Serbian in Latin script (2)
         (0x19 | 0x22 | 0x23 | 0x02 | 0x2f, _) | (0x1a, 3) => encoding_rs::WINDOWS_1251,
-        // Czech, Hungarian, Polish, Romanian, Slovak, Slovenian, Croatian
-        (0x05 | 0x0e | 0x15 | 0x18 | 0x1b | 0x24 | 0x1a, _) => encoding_rs::WINDOWS_1250,
+        // Czech, Hungarian, Polish, Romanian, Slovak, Slovenian, Albanian,
+        // Croatian
+        (0x05 | 0x0e | 0x15 | 0x18 | 0x1b | 0x24 | 0x1c | 0x1a, _) => encoding_rs::WINDOWS_1250,
         (0x08, _) => encoding_rs::WINDOWS_1253,
         (0x1f, _) => encoding_rs::WINDOWS_1254,
         (0x0d, _) => encoding_rs::WINDOWS_1255,
-        (0x01, _) => encoding_rs::WINDOWS_1256,
+        // Arabic, Urdu, Farsi
+        (0x01 | 0x20 | 0x29, _) => encoding_rs::WINDOWS_1256,
         (0x25..=0x27, _) => encoding_rs::WINDOWS_1257,
+        (0x2a, _) => encoding_rs::WINDOWS_1258,
+        (0x1e, _) => encoding_rs::WINDOWS_874,
         _ => encoding_rs::WINDOWS_1252,
     }
 }
@@ -219,6 +223,11 @@ mod tests {
         assert_eq!(windows_code_page(0x041a), encoding_rs::WINDOWS_1250);
         assert_eq!(windows_code_page(0x081a), encoding_rs::WINDOWS_1250);
         assert_eq!(windows_code_page(0x0c1a), encoding_rs::WINDOWS_1251);
+        assert_eq!(windows_code_page(0x041c), encoding_rs::WINDOWS_1250);
+        assert_eq!(windows_code_page(0x0429), encoding_rs::WINDOWS_1256);
+        assert_eq!(windows_code_page(0x0420), encoding_rs::WINDOWS_1256);
+        assert_eq!(windows_code_page(0x042a), encoding_rs::WINDOWS_1258);
+        assert_eq!(windows_code_page(0x041e), encoding_rs::WINDOWS_874);
         // a Western name with an accent, which is not valid UTF-8
         assert_eq!(
             decode_windows(b"Fran\xE7ais.txt", encoding_rs::WINDOWS_1252),

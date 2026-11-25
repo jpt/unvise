@@ -420,8 +420,8 @@ impl WinArchive {
     ///
     /// Returns [`Error::Skipped`] if the entry's data is in a companion
     /// `.qdat` volume that was not supplied, in a part of a multi-part
-    /// installer that was not supplied, past the end of the file, or not stored at all,
-    /// [`Error::Decompression`] if the data is out of range, does not decode,
+    /// installer that was not supplied, past the end of the file, or not
+    /// stored at all, [`Error::Decompression`] if the data does not decode
     /// or does not match the size recorded in the file table, or
     /// [`Error::Checksum`] if it does not match the recorded CRC-32
     pub fn read(&self, entry: &WinEntry) -> Result<Vec<u8>, Error> {
@@ -615,6 +615,7 @@ impl WinArchive {
                     total_out = total_out.saturating_add(bytes.len());
                     if total_out > budget {
                         on_progress(Progress::BudgetExceeded { budget });
+                        result.stopped_early = true;
                         break;
                     }
                 }

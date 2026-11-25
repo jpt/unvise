@@ -93,8 +93,13 @@ pub fn extract_payload(data: &[u8]) -> Result<(&[u8], usize), Error> {
 fn ne_overlay(data: &[u8], ne_off: usize) -> Result<(&[u8], usize), Error> {
     let ne = &data[ne_off..];
     let u16_at = |off: usize| read_u16(ne, off).map(usize::from);
-    let shift =
-        |value: usize, by: usize| u32::try_from(by).ok().and_then(|by| value.checked_shl(by));
+    // a shift that would push bits off the top is refused
+    let shift = |value: usize, by: usize| {
+        let by = u32::try_from(by).ok()?;
+        value
+            .checked_shl(by)
+            .filter(|shifted| shifted >> by == value)
+    };
     let overflow = || Error::InvalidArchive("executable header fields out of range".into());
 
     let names = (read_u32(ne, 0x2C)? as usize).saturating_add(u16_at(0x20)?);
@@ -109,7 +114,8 @@ fn ne_overlay(data: &[u8], ne_off: usize) -> Result<(&[u8], usize), Error> {
         // stands for 64 KiB
         if sector != 0 {
             let len = if len == 0 { 0x1_0000 } else { len };
-            end = end.max(shift(sector, segment_shift).ok_or_else(overflow)? + len);
+            let start = shift(sector, segment_shift).ok_or_else(overflow)?;
+            end = end.max(start.checked_add(len).ok_or_else(overflow)?);
         }
     }
 

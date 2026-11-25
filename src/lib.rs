@@ -323,6 +323,9 @@ pub struct ExtractResult {
     pub extracted: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Extraction stopped at the output limit, with entries left unread.
+    /// Those entries are in none of the counts
+    pub stopped_early: bool,
 }
 
 /// How a Mac file's resource fork and Finder information are written out
@@ -567,7 +570,8 @@ impl Archive {
     /// # Errors
     ///
     /// Returns [`Error::InvalidArchive`] if the data is not a recognized VISE
-    /// archive format
+    /// archive format, or [`Error::Decompression`] if its file table is
+    /// compressed and does not decompress
     pub fn parse(data: Vec<u8>) -> Result<Self, Error> {
         Self::parse_with_encoding(data, NameEncoding::default())
     }
@@ -882,13 +886,14 @@ impl Archive {
                             });
                             result.extracted += 1;
                             total_out = total_out.saturating_add(data_len).saturating_add(rsrc_len);
-                            if total_out > output_budget {
-                                on_progress(Progress::BudgetExceeded {
-                                    budget: output_budget,
-                                });
-                                break;
-                            }
                         }
+                    }
+                    if total_out > output_budget {
+                        on_progress(Progress::BudgetExceeded {
+                            budget: output_budget,
+                        });
+                        result.stopped_early = true;
+                        break;
                     }
                 }
             }

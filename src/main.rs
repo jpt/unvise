@@ -158,7 +158,11 @@ fn extract_mac(data: Vec<u8>, args: &Args, encoding: NameEncoding) {
             BundlePair::Data(data_file) => {
                 Archive::parse_with_data_file(&data, data_file, encoding)
             }
-            BundlePair::Table(table) => Archive::parse_with_data_file(&table, data, encoding),
+            // the names are in the table file, so its resources say which
+            // script they are in
+            BundlePair::Table(table, table_encoding) => {
+                Archive::parse_with_data_file(&table, data, args.encoding.unwrap_or(table_encoding))
+            }
         }
     } else if segments.is_empty() {
         Archive::parse_with_encoding(data, encoding)
@@ -185,13 +189,10 @@ fn extract_mac(data: Vec<u8>, args: &Args, encoding: NameEncoding) {
     eprintln!("Extracting to {}/", out_dir.display());
     eprintln!();
 
-    let mut stopped = false;
     let result = archive
-        .extract_with_options(out_dir, &options, |progress| {
-            stopped |= report(progress);
-        })
+        .extract_with_options(out_dir, &options, report)
         .unwrap_or_else(|e| fail(&e.to_string()));
-    finish(result, stopped);
+    finish(result);
 }
 
 fn extract_win(data: Vec<u8>, input: &Path, out_dir: &Path) {
@@ -222,17 +223,14 @@ fn extract_win(data: Vec<u8>, input: &Path, out_dir: &Path) {
     eprintln!("Extracting to {}/", out_dir.display());
     eprintln!();
 
-    let mut stopped = false;
     let result = archive
-        .extract_with(out_dir, |progress| stopped |= report(progress))
+        .extract_with(out_dir, report)
         .unwrap_or_else(|e| fail(&e.to_string()));
-    finish(result, stopped);
+    finish(result);
 }
 
-/// Prints one line per entry as the library works through the archive.
-/// Returns whether the library is stopping before the end of it
-fn report(progress: Progress<'_>) -> bool {
-    let stopping = matches!(progress, Progress::BudgetExceeded { .. });
+/// Prints one line per entry as the library works through the archive
+fn report(progress: Progress<'_>) {
     let shown = |name| {
         if str::is_empty(name) {
             "(unnamed)"
@@ -262,18 +260,17 @@ fn report(progress: Progress<'_>) -> bool {
         ),
         _ => {}
     }
-    stopping
 }
 
 /// Prints the totals. The exit status is 1 if an entry failed or the run
 /// stopped before the end of the archive
-fn finish(result: unvise::ExtractResult, stopped: bool) {
+fn finish(result: unvise::ExtractResult) {
     eprintln!();
     eprintln!(
         "Done: {} extracted, {} skipped, {} failed",
         result.extracted, result.skipped, result.failed
     );
-    if result.failed > 0 || stopped {
+    if result.failed > 0 || result.stopped_early {
         process::exit(1);
     }
 }
@@ -298,7 +295,10 @@ fn find_qdat(payload: &[u8], input: &Path) -> Option<Vec<u8>> {
 
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("qdat") {
+        let is_qdat = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("qdat"));
+        if !is_qdat || !path.is_file() {
             continue;
         }
         if let Ok(data) = std::fs::read(&path) {
@@ -330,6 +330,9 @@ fn find_volumes(archive: &WinArchive, input: &Path) -> Vec<Vec<u8>> {
     };
     let mut volumes = Vec::new();
     for path in dir.flatten().map(|entry| entry.path()) {
+        if !path.is_file() {
+            continue;
+        }
         let mut header = [0u8; 16];
         let is_part = std::fs::File::open(&path)
             .and_then(|mut file| file.read_exact(&mut header))
@@ -353,8 +356,9 @@ fn find_volumes(archive: &WinArchive, input: &Path) -> Vec<Vec<u8>> {
 enum BundlePair {
     /// The input holds the file table; this is the file data
     Data(Vec<u8>),
-    /// The input holds the file data; this is the file table
-    Table(Vec<u8>),
+    /// The input holds the file data; this is the file table, and the
+    /// encoding of the names in it
+    Table(Vec<u8>, NameEncoding),
 }
 
 /// First format version of the Mac OS X installers
@@ -384,10 +388,14 @@ fn find_bundle_pair(data: &[u8], input: &Path) -> Option<BundlePair> {
 
     if !has_table {
         let dir = contents.join("MacOSClassic");
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if !entry.path().is_file() {
+                continue;
+            }
             let Ok(raw) = std::fs::read(entry.path()) else {
                 continue;
             };
+            let encoding = unvise::mac_name_encoding(&raw);
             let table = unvise::macbinary::strip(raw);
             let table_at = table.get(0x24..0x28).map_or(usize::MAX, |b| {
                 u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize
@@ -398,7 +406,7 @@ fn find_bundle_pair(data: &[u8], input: &Path) -> Option<BundlePair> {
                     .is_some_and(|t| t.starts_with(b"CVCT"))
             {
                 eprintln!("File table: {}", entry.path().display());
-                return Some(BundlePair::Table(table));
+                return Some(BundlePair::Table(table, encoding));
             }
         }
         eprintln!(
@@ -454,8 +462,9 @@ fn find_segments(main_data: &[u8], input: &Path) -> Vec<Vec<u8>> {
             continue;
         }
 
-        // Probe the first 132 bytes before reading the full file
-        let mut probe = [0u8; 132];
+        // Probe the header, bare or behind a MacBinary one, before reading
+        // the full file
+        let mut probe = [0u8; 136];
         let Ok(mut f) = std::fs::File::open(&path) else {
             continue;
         };
@@ -464,9 +473,15 @@ fn find_segments(main_data: &[u8], input: &Path) -> Vec<Vec<u8>> {
         };
         drop(f);
 
-        let is_svct =
-            (n >= 0x2c && &probe[..4] == b"SVCT") || (n >= 128 + 4 && &probe[128..132] == b"SVCT");
-        if !is_svct {
+        let header = if n >= 0x2c && &probe[..4] == b"SVCT" {
+            &probe[..8]
+        } else if n >= 136 && &probe[128..132] == b"SVCT" {
+            &probe[128..136]
+        } else {
+            continue;
+        };
+        // the main file of another installer is not a later segment
+        if u32::from_be_bytes([header[4], header[5], header[6], header[7]]) <= 1 {
             continue;
         }
 
@@ -496,6 +511,11 @@ fn find_segments(main_data: &[u8], input: &Path) -> Vec<Vec<u8>> {
             eprintln!("Segment {seq}: {}", path.display());
             segments.push(data);
             want += 1;
+        } else if seq < want {
+            eprintln!(
+                "warning: ignoring {}: another file is already in use as segment {seq}",
+                path.display()
+            );
         } else {
             eprintln!(
                 "warning: ignoring segment {seq} ({}): segment {want} is needed next",
