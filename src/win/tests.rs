@@ -796,9 +796,35 @@ fn folder_links_that_loop_end() {
     let mut folders = HashMap::new();
     folders.insert(1, ("a".to_string(), 2));
     folders.insert(2, ("b".to_string(), 1));
-    let path = folder_path(&folders, 1);
-    assert_eq!(path.split('/').count(), MAX_FOLDER_DEPTH);
+    assert_eq!(folder_path(&folders, 1), "b/a");
     assert_eq!(folder_path(&folders, 99), "");
+}
+
+#[test]
+fn a_folder_path_stops_growing_past_its_limit() {
+    let name = "n".repeat(usize::from(MAX_STRING_LEN));
+    let folders: HashMap<u32, (String, u32)> = (1..=u32::try_from(MAX_FOLDER_DEPTH).unwrap())
+        .map(|id| (id, (name.clone(), id + 1)))
+        .collect();
+    assert_eq!(folder_path(&folders, 1), name);
+
+    let mut short = HashMap::new();
+    short.insert(1, ("a".repeat(MAX_FOLDER_PATH - 1), 2));
+    short.insert(2, ("b".to_string(), 3));
+    short.insert(3, ("c".to_string(), 0));
+    assert_eq!(folder_path(&short, 1).split('/').count(), 2);
+}
+
+#[test]
+fn a_run_of_bare_types_does_not_slow_the_search_for_a_stream() {
+    // a count in range at every offset, then bare types to the end
+    let bare = (1..64)
+        .find(|&t| NEWEST.is_bare(t))
+        .expect("the newest layout has a bare type");
+    let data: Vec<u8> = std::iter::repeat_n(bare.to_le_bytes(), 1 << 18)
+        .flatten()
+        .collect();
+    assert!(find_record_stream(&data, 0, 0, NEWEST).is_err());
 }
 
 #[test]

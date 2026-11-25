@@ -11,9 +11,9 @@ use super::grammar;
 use super::grammar::Text;
 use super::layouts::LayoutId;
 use super::{
-    Error, Location, MAX_FOLDER_DEPTH, MAX_RECORD_BODY, MAX_RECORD_COUNT, MAX_RECORD_ID,
-    PARENT_LOOKAHEAD, QDAT_ENTRIES_OFFSET, QDAT_ENTRY_HEADER, SOURCE_DOWNLOAD_ITEM, STUB_FLAG,
-    WinEntry,
+    Error, Location, MAX_FOLDER_DEPTH, MAX_FOLDER_PATH, MAX_RECORD_BODY, MAX_RECORD_COUNT,
+    MAX_RECORD_ID, PARENT_LOOKAHEAD, QDAT_ENTRIES_OFFSET, QDAT_ENTRY_HEADER, SOURCE_DOWNLOAD_ITEM,
+    STUB_FLAG, WinEntry,
 };
 use crate::text::decode_windows;
 
@@ -450,13 +450,20 @@ pub(super) fn filetime(ticks: u64) -> Option<SystemTime> {
 /// The path of the folder record `id`, built by following parent links up to
 /// the root. The layouts that store no folder with each file keep the
 /// install tree this way
+///
+/// Every file gets a copy of its folder's path, so the path is kept short:
+/// the climb stops at [`MAX_FOLDER_DEPTH`] folders, at a folder already
+/// passed, or once the names add up to [`MAX_FOLDER_PATH`] bytes
 pub(super) fn folder_path(folders: &HashMap<u32, (String, u32)>, mut id: u32) -> String {
     let mut names = Vec::new();
+    let mut passed = Vec::new();
+    let mut len = 0;
     while let Some((name, parent)) = folders.get(&id) {
-        // also stops a parent link that loops back on itself
-        if names.len() == MAX_FOLDER_DEPTH {
+        if names.len() == MAX_FOLDER_DEPTH || len >= MAX_FOLDER_PATH || passed.contains(&id) {
             break;
         }
+        passed.push(id);
+        len += name.len();
         // a separator inside one folder name would split it in two
         names.push(name.replace(['/', '\\'], "_"));
         id = *parent;

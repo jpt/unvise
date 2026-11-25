@@ -7,9 +7,9 @@
 //! Extracted files can be written in the same form, which keeps both forks
 //! and the Finder information together in one file
 
-/// If `data` begins with a plausible `MacBinary` header, returns a copy of the
-/// data fork payload (skipping the 128-byte header). Otherwise returns the
-/// input unchanged
+/// If `data` begins with a plausible `MacBinary` header and its data fork
+/// starts with an archive header, returns a copy of the data fork (skipping
+/// the 128-byte header). Otherwise returns the input unchanged
 #[must_use]
 pub fn strip(data: Vec<u8>) -> Vec<u8> {
     if data.len() <= 128 {
@@ -91,6 +91,9 @@ pub fn region(data: &[u8]) -> Option<u16> {
             }
             fallback.get_or_insert(code);
         }
+        // a map lists each type once, so one that repeats `vers` is not
+        // read again
+        break;
     }
     fallback
 }
