@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1
+
+### Changed
+- The CLI exits with status 1 when extraction stops at the output limit
+- The README is rewritten
+
+### Fixed
+- Windows: searching for the record stream could take very long on a file made of record types that have nothing after their number
+- Windows: a folder path built from folder records is limited in length and stops at a folder that is its own ancestor. Every file gets a copy of that path, so a small installer could ask for a great deal of memory
+- A MacBinary file whose resource map repeats the `vers` type could take a long time to open
+- The `--forks` help and the `ForkFormat` documentation said that AppleDouble output keeps dates. It keeps type and creator codes and Finder flags; only MacBinary output keeps dates
+- Documentation of `WinArchive::extract`, `Archive::extract`, `Reader::read` and `macbinary::strip` now says what they return
+
 ## 0.5.0
 
 ### Added

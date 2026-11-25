@@ -334,11 +334,11 @@ pub enum ForkFormat {
     #[default]
     Rsrc,
     /// `AppleDouble`: the data fork as the file, and a `._name` file next to
-    /// it holding the resource fork, type and creator codes, Finder flags
-    /// and dates. macOS reads the pair back as one file
+    /// it holding the resource fork, type and creator codes and Finder
+    /// flags. macOS reads the pair back as one file
     AppleDouble,
-    /// `MacBinary` II: one `name.bin` file holding both forks and the same
-    /// information. Emulators and HFS tools take this form
+    /// `MacBinary` II: one `name.bin` file holding both forks, type and
+    /// creator codes, Finder flags and dates. HFS tools take this form
     MacBinary,
 }
 
@@ -543,8 +543,9 @@ impl Reader<'_> {
     /// # Errors
     ///
     /// Returns [`Error::Skipped`] if the entry has no data in this archive
-    /// (a condition record, or a file on another segment or disc), or
-    /// [`Error::Decompression`] if its data cannot be decoded
+    /// (a condition record, or a file on another segment or disc),
+    /// [`Error::Decompression`] if its data cannot be decoded, or
+    /// [`Error::Checksum`] if what it decodes to does not match its CRC-32
     pub fn read(&mut self, entry: &FileEntry) -> Result<Forks, Error> {
         self.archive.decode(entry, &mut self.cache)
     }
@@ -760,7 +761,7 @@ impl Archive {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if a directory cannot be created
+    /// Returns [`Error::Io`] if the output directory cannot be created
     pub fn extract(&self, out_dir: &Path) -> Result<ExtractResult, Error> {
         self.extract_with(out_dir, |_| {})
     }

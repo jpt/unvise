@@ -72,6 +72,8 @@ const MAX_RECORD_ID: u32 = 0x0100_0000;
 const MAX_RECORD_BODY: usize = 1 << 18;
 /// Deepest folder nesting followed when building an install path
 const MAX_FOLDER_DEPTH: usize = 64;
+/// Length in bytes past which no further folder is added to an install path
+const MAX_FOLDER_PATH: usize = 1024;
 /// Record-stream start positions tried per record layout
 const MAX_STREAM_CANDIDATES: usize = 16;
 
@@ -515,7 +517,8 @@ impl WinArchive {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] on filesystem failures
+    /// Returns [`Error::Io`] if `out_dir` cannot be created. A file or
+    /// folder inside it that cannot be written is counted as failed
     pub fn extract(&self, out_dir: &Path) -> Result<ExtractResult, Error> {
         self.extract_with(out_dir, |_| {})
     }
@@ -525,7 +528,8 @@ impl WinArchive {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] on filesystem failures
+    /// Returns [`Error::Io`] if `out_dir` cannot be created. A file or
+    /// folder inside it that cannot be written is counted as failed
     pub fn extract_with(
         &self,
         out_dir: &Path,

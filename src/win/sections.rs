@@ -95,24 +95,33 @@ pub(super) fn chain_name_bytes(name: &str) -> Option<Vec<u8>> {
 /// then, past any record types that have nothing after their number, a
 /// type in range followed by a common header that parses
 pub(super) fn starts_record_stream(data: &[u8], off: usize, layout: LayoutId) -> bool {
-    let field = |at: usize| {
-        let bytes = data.get(at..at.checked_add(4)?)?;
-        Some(u32::from_le_bytes(bytes.try_into().unwrap()))
-    };
-    if !field(off).is_some_and(|count| (1..=MAX_RECORD_COUNT).contains(&count)) {
-        return false;
+    has_record_count(data, off)
+        && first_record_reads(data, bare_types_end(data, off + 4, layout), layout)
+}
+
+fn u32_at(data: &[u8], at: usize) -> Option<u32> {
+    let bytes = data.get(at..at.checked_add(4)?)?;
+    Some(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn has_record_count(data: &[u8], off: usize) -> bool {
+    u32_at(data, off).is_some_and(|count| (1..=MAX_RECORD_COUNT).contains(&count))
+}
+
+/// Where the run of record types with nothing after their number, starting
+/// at `at`, ends. That is `at` itself when there is no such type there
+fn bare_types_end(data: &[u8], mut at: usize, layout: LayoutId) -> usize {
+    while u32_at(data, at).is_some_and(|rtype| layout.is_bare(rtype)) {
+        at += 4;
     }
-    let mut at = off + 4;
-    loop {
-        match field(at) {
-            Some(rtype) if layout.is_bare(rtype) => at += 4,
-            Some(rtype) => {
-                return layout.has_type(rtype)
-                    && grammar::record_header(&mut Cursor::new(data, at + 4, layout)).is_ok();
-            }
-            None => return false,
-        }
-    }
+    at
+}
+
+/// Whether `at` holds a type in range followed by a common header that
+/// parses
+fn first_record_reads(data: &[u8], at: usize, layout: LayoutId) -> bool {
+    u32_at(data, at).is_some_and(|rtype| layout.has_type(rtype))
+        && grammar::record_header(&mut Cursor::new(data, at + 4, layout)).is_ok()
 }
 
 /// How far past the embedded files a record stream is searched for
@@ -129,8 +138,21 @@ pub(super) fn find_record_stream(
     layout: LayoutId,
 ) -> Result<usize, Error> {
     let search_end = data.len().min(chain_end.saturating_add(STREAM_SEARCH));
+    // A run of types with nothing after their number is walked once for
+    // each of the four alignments, not once for every offset inside it
+    let mut runs = [(0, 0); 4];
     (from..search_end)
-        .find(|&off| starts_record_stream(data, off, layout))
+        .find(|&off| {
+            if !has_record_count(data, off) {
+                return false;
+            }
+            let at = off + 4;
+            let (run_start, run_end) = &mut runs[at % 4];
+            if !(*run_start..*run_end).contains(&at) {
+                (*run_start, *run_end) = (at, bare_types_end(data, at, layout));
+            }
+            first_record_reads(data, (*run_end).max(at), layout)
+        })
         .ok_or_else(|| Error::InvalidArchive("record stream not found".into()))
 }
 

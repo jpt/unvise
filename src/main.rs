@@ -22,9 +22,9 @@ options:
                        rsrc         resource fork as name.rsrc (default);
                                     type and creator codes are not kept
                        appledouble  ._name file with the resource fork,
+                                    type, creator and Finder flags
+                       macbinary    one name.bin file holding both forks,
                                     type, creator, Finder flags and dates
-                       macbinary    one name.bin file holding both forks
-                                    and the same information
   --encoding <name>  text encoding of the names in a Mac archive: macroman,
                      macjapanese, mackorean, macchinesesimp, macchinesetrad
                      or maccyrillic. By default it is read from the
@@ -185,10 +185,13 @@ fn extract_mac(data: Vec<u8>, args: &Args, encoding: NameEncoding) {
     eprintln!("Extracting to {}/", out_dir.display());
     eprintln!();
 
+    let mut stopped = false;
     let result = archive
-        .extract_with_options(out_dir, &options, report)
+        .extract_with_options(out_dir, &options, |progress| {
+            stopped |= report(progress);
+        })
         .unwrap_or_else(|e| fail(&e.to_string()));
-    finish(result);
+    finish(result, stopped);
 }
 
 fn extract_win(data: Vec<u8>, input: &Path, out_dir: &Path) {
@@ -219,14 +222,17 @@ fn extract_win(data: Vec<u8>, input: &Path, out_dir: &Path) {
     eprintln!("Extracting to {}/", out_dir.display());
     eprintln!();
 
+    let mut stopped = false;
     let result = archive
-        .extract_with(out_dir, report)
+        .extract_with(out_dir, |progress| stopped |= report(progress))
         .unwrap_or_else(|e| fail(&e.to_string()));
-    finish(result);
+    finish(result, stopped);
 }
 
-/// Prints one line per entry as the library works through the archive
-fn report(progress: Progress<'_>) {
+/// Prints one line per entry as the library works through the archive.
+/// Returns whether the library is stopping before the end of it
+fn report(progress: Progress<'_>) -> bool {
+    let stopping = matches!(progress, Progress::BudgetExceeded { .. });
     let shown = |name| {
         if str::is_empty(name) {
             "(unnamed)"
@@ -256,15 +262,18 @@ fn report(progress: Progress<'_>) {
         ),
         _ => {}
     }
+    stopping
 }
 
-fn finish(result: unvise::ExtractResult) {
+/// Prints the totals. The exit status is 1 if an entry failed or the run
+/// stopped before the end of the archive
+fn finish(result: unvise::ExtractResult, stopped: bool) {
     eprintln!();
     eprintln!(
         "Done: {} extracted, {} skipped, {} failed",
         result.extracted, result.skipped, result.failed
     );
-    if result.failed > 0 {
+    if result.failed > 0 || stopped {
         process::exit(1);
     }
 }
